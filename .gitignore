@@ -1,0 +1,34 @@
+# Source code
+cmd/
+internal/
+go.mod
+go.sum
+go.work
+go.work.sum
+
+# Build scripts
+build.sh
+
+# Documentation
+设计文档.md
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*~
+test*.md
+
+# Binary (keep dist/ only)
+*.exe
+!dist/*.exe
+free-x
+!dist/free-x-*
