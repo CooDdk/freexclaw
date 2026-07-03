@@ -1,17 +1,3 @@
-# Source code
-cmd/
-internal/
-go.mod
-go.sum
-go.work
-go.work.sum
-
-# Build scripts
-build.sh
-
-# Documentation
-设计文档.md
-
 # IDE
 .idea/
 .vscode/
@@ -26,9 +12,12 @@ Thumbs.db
 *.tmp
 *~
 test*.md
+设计文档.md
+.tmp-go/
+debugmain.go
 
-# Binary (keep dist/ only)
+# Build outputs
+dist/
 *.exe
-!dist/*.exe
+freexclaw
 free-x
-!dist/free-x-*
