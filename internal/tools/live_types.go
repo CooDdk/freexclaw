@@ -7,6 +7,7 @@ type LiveQueryContext struct {
 	Symbol       string
 	MarketType   string
 	ForecastDays int
+	TimeOfDay    string
 }
 
 type MatchResult struct {
@@ -16,6 +17,7 @@ type MatchResult struct {
 	Symbol       string
 	MarketType   string
 	ForecastDays int
+	TimeOfDay    string
 	Query        string
 }
 

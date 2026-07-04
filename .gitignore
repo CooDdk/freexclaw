@@ -9,6 +9,7 @@
 Thumbs.db
 
 # Temp files
+tmp/
 *.tmp
 *~
 test*.md

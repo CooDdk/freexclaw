@@ -23,6 +23,96 @@ func TestRouteLiveQuery_WeatherFollowUpUsesContext(t *testing.T) {
 	}
 }
 
+func TestRouteLiveQuery_WeatherFollowUpParsesThreeDays(t *testing.T) {
+	ctx := LiveQueryContext{
+		Domain:       "weather",
+		Location:     "武汉",
+		ForecastDays: 1,
+	}
+
+	match := MatchLiveQuery("未来3天的呢", ctx)
+	if match.Domain != "weather" {
+		t.Fatalf("expected weather domain, got %q", match.Domain)
+	}
+	if match.Location != "武汉" {
+		t.Fatalf("expected inherited location 武汉, got %q", match.Location)
+	}
+	if match.ForecastDays != 3 {
+		t.Fatalf("expected 3-day forecast, got %d", match.ForecastDays)
+	}
+}
+
+func TestRouteLiveQuery_WeatherFollowUpWithNewLocationOverridesContext(t *testing.T) {
+	ctx := LiveQueryContext{
+		Domain:       "weather",
+		Location:     "昆明",
+		ForecastDays: 7,
+	}
+
+	match := MatchLiveQuery("北京未来3天的呢", ctx)
+	if match.Domain != "weather" {
+		t.Fatalf("expected weather domain, got %q", match.Domain)
+	}
+	if match.Location != "北京" {
+		t.Fatalf("expected new location 北京, got %q", match.Location)
+	}
+	if match.ForecastDays != 3 {
+		t.Fatalf("expected 3-day forecast, got %d", match.ForecastDays)
+	}
+}
+
+func TestRouteLiveQuery_WeatherLatestFollowUpUsesContext(t *testing.T) {
+	ctx := LiveQueryContext{
+		Domain:       "weather",
+		Location:     "北京",
+		ForecastDays: 1,
+	}
+
+	match := MatchLiveQuery("最新的天气", ctx)
+	if match.Domain != "weather" {
+		t.Fatalf("expected weather domain, got %q", match.Domain)
+	}
+	if match.Location != "北京" {
+		t.Fatalf("expected inherited location 北京, got %q", match.Location)
+	}
+	if match.ForecastDays != 1 {
+		t.Fatalf("expected current weather query, got %d-day forecast", match.ForecastDays)
+	}
+}
+
+func TestRouteLiveQuery_WeatherTimeOfDayFollowUp(t *testing.T) {
+	ctx := LiveQueryContext{
+		Domain:   "weather",
+		Location: "北京",
+	}
+
+	match := MatchLiveQuery("北京下午的天气", ctx)
+	if match.Domain != "weather" {
+		t.Fatalf("expected weather domain, got %q", match.Domain)
+	}
+	if match.Location != "北京" {
+		t.Fatalf("expected location 北京, got %q", match.Location)
+	}
+	if match.TimeOfDay != "下午" {
+		t.Fatalf("expected time of day 下午, got %q", match.TimeOfDay)
+	}
+}
+
+func TestRouteLiveQuery_WeatherCurrentFollowUpUsesContext(t *testing.T) {
+	ctx := LiveQueryContext{
+		Domain:   "weather",
+		Location: "北京",
+	}
+
+	match := MatchLiveQuery("当前的天气呢", ctx)
+	if match.Domain != "weather" {
+		t.Fatalf("expected weather domain, got %q", match.Domain)
+	}
+	if match.Location != "北京" {
+		t.Fatalf("expected inherited location 北京, got %q", match.Location)
+	}
+}
+
 func TestRouteLiveQuery_FinanceAndNewsAreRecognized(t *testing.T) {
 	finance := MatchLiveQuery("美元兑人民币", LiveQueryContext{})
 	if finance.Domain != "finance" || finance.MarketType != "fx" {

@@ -17,7 +17,7 @@ func TestSystemPromptIncludesReadableWeatherInstructions(t *testing.T) {
 		"<web_search>北京 今天 天气</web_search>",
 		"你必须使用 <web_search> 工具",
 		"<run_command>",
-		"go test ./...",
+		"go build ./...",
 	) {
 		t.Fatalf("system prompt should contain readable weather/tool instructions, got: %q", prompt)
 	}

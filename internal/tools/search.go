@@ -18,19 +18,29 @@ type SearchResult struct {
 }
 
 func WebSearch(query string, maxResults int) ([]SearchResult, error) {
+	return WebSearchWithProgress(query, maxResults, nil)
+}
+
+func WebSearchWithProgress(query string, maxResults int, progress func(string)) ([]SearchResult, error) {
 	if maxResults <= 0 {
 		maxResults = 5
 	}
 
 	match := MatchLiveQuery(query, currentLiveQueryContext)
 	if match.Domain != "generic_search" {
-		liveResult, err := ResolveLiveQuery(query)
+		if progress != nil {
+			progress("正在处理实时查询...")
+		}
+		liveResult, err := ResolveLiveQueryWithProgress(query, progress)
 		if err != nil {
 			return nil, fmt.Errorf("实时查询失败: %w", err)
 		}
 		if liveResult != nil {
 			return []SearchResult{*liveResult}, nil
 		}
+	}
+	if progress != nil {
+		progress("正在搜索网络...")
 	}
 	return bingSearch(query, maxResults)
 }

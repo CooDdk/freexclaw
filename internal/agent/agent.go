@@ -58,7 +58,7 @@ func SystemPrompt() string {
 
 **当用户要求读取文件时，你必须使用 <read_file> 工具！**
 
-**当任务是“创建一个可运行的项目 / 服务 / 脚本”时，你不能只写单个源码文件就结束。你应该优先检查当前目录结构，补齐项目所需的配置文件、依赖声明和目录结构，并尽量自动完成初始化、安装依赖和基础校验。**
+**当任务是“创建一个可运行的项目 / 服务 / 脚本”时，你不能只写单个源码文件就结束。你应该优先检查当前目录结构，补齐必要文件，并在需要时用 <run_command> 做初始化和验证。**
 
 **当你已经写完代码后，应继续使用 <run_command> 执行短时命令做验证，而不是停留在“请用户自行运行”。**
 
@@ -67,20 +67,6 @@ func SystemPrompt() string {
 **如果命令失败，你应该根据错误继续修复文件或依赖，然后再次验证，直到得到一个尽量可运行、可通过基础检查的结果。**
 
 **工具调用必须单独占一行，前后要有空行。**
-
-## 创建项目时的默认工作流
-
-1. 先用 <list_dir> 查看当前目录，必要时用 <read_file> 读取已有配置。
-2. 生成项目时不要只写业务文件；要同时补齐必要的清单或配置文件。
-3. 写完文件后用 <run_command> 自动完成初始化和依赖安装。
-4. 再用 <run_command> 做最小验证，并根据结果继续修复。
-5. 最后明确告诉用户你实际执行过哪些命令、哪些检查通过了。
-
-## 常见语言的最低验证要求
-
-- Go：优先补齐 go.mod；常用命令包括 go mod init、go mod tidy、go test ./...、go vet ./...、go build ./...
-- Node.js：优先补齐 package.json；常用命令包括 npm init -y、npm install、npm test、npm run build
-- Python：优先补齐 requirements.txt 或 pyproject.toml；常用命令包括 pip install、pytest、python -m py_compile
 
 ## 正确示例
 
@@ -124,7 +110,7 @@ go mod tidy
 </run_command>
 
 <run_command>
-go test ./...
+go build ./...
 </run_command>`
 }
 
@@ -226,6 +212,10 @@ func ParseToolCall(content string) *ToolCall {
 }
 
 func ExecuteTool(tc *ToolCall) ToolResult {
+	return ExecuteToolWithProgress(tc, nil)
+}
+
+func ExecuteToolWithProgress(tc *ToolCall, progress func(string)) ToolResult {
 	switch tc.Name {
 	case "read_file":
 		return executeReadFile(tc.Arguments)
@@ -236,7 +226,7 @@ func ExecuteTool(tc *ToolCall) ToolResult {
 	case "list_dir":
 		return executeListDir(tc.Arguments)
 	case "web_search":
-		return executeWebSearch(tc.Arguments)
+		return executeWebSearch(tc.Arguments, progress)
 	case "run_command":
 		return executeRunCommand(tc.Arguments)
 	default:
@@ -387,13 +377,13 @@ func AutoExtractFileContent(content string) (bool, string, error) {
 	return true, fileName, nil
 }
 
-func executeWebSearch(args map[string]interface{}) ToolResult {
+func executeWebSearch(args map[string]interface{}, progress func(string)) ToolResult {
 	query, ok := args["query"].(string)
 	if !ok || query == "" {
 		return ToolResult{Success: false, Error: "缺少 query 参数"}
 	}
 
-	results, err := tools.WebSearch(query, 5)
+	results, err := tools.WebSearchWithProgress(query, 5, progress)
 	if err != nil {
 		return ToolResult{Success: false, Error: err.Error()}
 	}

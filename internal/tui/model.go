@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -55,6 +56,15 @@ type streamMsg struct {
 	err     error
 }
 
+type toolProgressMsg struct {
+	text string
+}
+
+type toolExecutedMsg struct {
+	tc     *agent.ToolCall
+	result agent.ToolResult
+}
+
 type tickMsg time.Time
 
 func tickCmd() tea.Cmd {
@@ -73,6 +83,8 @@ func splashTickCmd() tea.Cmd {
 
 type splashEndMsg struct{}
 
+const ctrlCExitConfirmWindow = 2 * time.Second
+
 type Model struct {
 	cfg          *config.Config
 	llmClient    *llm.Client
@@ -86,9 +98,12 @@ type Model struct {
 	streamCtx    context.Context
 	streamCancel context.CancelFunc
 	chunkCh      <-chan llm.StreamChunk
+	toolCh       <-chan tea.Msg
 	showHelp     bool
 	err          error
 	dotsAnim     int
+	isToolRunning bool
+	toolStatusText string
 	// 命令提示面板
 	commandHintVisible bool
 	commandHintIndex   int
@@ -102,6 +117,16 @@ type Model struct {
 	showSplash     bool
 	splashStage    int
 	splashProgress float64
+	runtimePromptProfile string
+	runtimePromptSummary string
+	turnPrompt         string
+	turnTouchedFiles   []string
+	turnExecutedCommands []string
+	turnSawRunCommand  bool
+	turnEngineeringNudged bool
+	turnAutoPlanned    bool
+	turnAutoToolQueue  []*agent.ToolCall
+	ctrlCPrimedAt      time.Time
 }
 
 func NewModel(cfg *config.Config) (*Model, error) {
@@ -196,8 +221,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamMsg:
 		return m.handleStreamMsg(msg)
 
+	case toolProgressMsg:
+		m.toolStatusText = msg.text
+		m.forceScrollBottom = true
+		m.updateChatView()
+		return m, m.waitForToolEvent()
+
+	case toolExecutedMsg:
+		return m.handleToolExecuted(msg)
+
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
+
+	case tea.MouseMsg:
+		return m.handleMouseMsg(msg)
 	}
 
 	if m.focus == focusInput {
@@ -214,6 +251,47 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.showSplash {
+		m.showSplash = false
+		m.forceScrollBottom = true
+		m.updateChatView()
+		return m, nil
+	}
+
+	m.clearCtrlCExitState()
+
+	switch {
+	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
+		if m.isChatAreaY(msg.Y) {
+			m.setFocusChat()
+			return m, nil
+		}
+		if m.isInputZoneY(msg.Y) {
+			m.setFocusInput()
+			return m, nil
+		}
+	case msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown:
+		if m.isInputZoneY(msg.Y) && !m.isStreaming && !m.commandHintVisible {
+			m.setFocusInput()
+			if msg.Button == tea.MouseButtonWheelUp {
+				m.navigateHistory(-1)
+			} else {
+				m.navigateHistory(1)
+			}
+			return m, nil
+		}
+		if m.isChatAreaY(msg.Y) {
+			m.setFocusChat()
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			return m, cmd
+		}
+	}
+
+	return m, nil
+}
+
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showSplash {
 		m.showSplash = false
@@ -222,17 +300,27 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if msg.String() != "ctrl+c" {
+		m.clearCtrlCExitState()
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		if m.isStreaming {
 			m.stopStreaming()
+			m.clearCtrlCExitState()
 			m.updateChatView()
 			return m, nil
 		}
-		m.convMgr.Save()
-		return m, tea.Quit
+		if m.shouldQuitOnCtrlC() {
+			m.convMgr.Save()
+			return m, tea.Quit
+		}
+		m.prepareCtrlCToClearInput()
+		return m, nil
 
 	case "esc":
+		m.clearCtrlCExitState()
 		// 命令提示面板开启时，esc 优先关闭提示
 		if m.commandHintVisible {
 			m.commandHintVisible = false
@@ -262,7 +350,7 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "enter":
-		if !m.isStreaming {
+		if !m.isStreaming && !m.isToolRunning {
 			return m, m.sendMessage()
 		}
 		return m, nil
@@ -320,6 +408,42 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) setFocusInput() {
+	m.focus = focusInput
+	m.textarea.Focus()
+}
+
+func (m *Model) setFocusChat() {
+	m.focus = focusChat
+	m.textarea.Blur()
+}
+
+func (m *Model) shouldQuitOnCtrlC() bool {
+	return !m.ctrlCPrimedAt.IsZero() && time.Since(m.ctrlCPrimedAt) <= ctrlCExitConfirmWindow
+}
+
+func (m *Model) prepareCtrlCToClearInput() {
+	m.ctrlCPrimedAt = time.Now()
+	m.focus = focusInput
+	m.textarea.Focus()
+	m.textarea.SetValue("")
+	m.commandHintVisible = false
+	m.commandHintIndex = 0
+	m.inputHistoryTemp = ""
+	m.resize()
+}
+
+func (m *Model) clearCtrlCExitState() {
+	if m.ctrlCPrimedAt.IsZero() {
+		return
+	}
+	if time.Since(m.ctrlCPrimedAt) > ctrlCExitConfirmWindow {
+		m.ctrlCPrimedAt = time.Time{}
+		return
+	}
+	m.ctrlCPrimedAt = time.Time{}
+}
+
 func (m *Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "j", "down":
@@ -374,29 +498,48 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 				current.Messages = current.Messages[:len(current.Messages)-1]
 			}
 		}
-		m.updateChatView()
-		m.convMgr.Save()
-
 		// 检测是否有工具调用
 		lastContent := ""
 		if len(current.Messages) > 0 {
 			lastContent = current.Messages[len(current.Messages)-1].Content
 		}
 		if tc := agent.ParseToolCall(lastContent); tc != nil {
-			return m, m.executeToolAndContinue(tc)
-		}
-
-		// 如果没有工具调用，尝试自动提取文件内容
-		if extracted, filePath, err := agent.AutoExtractFileContent(lastContent); extracted {
-			if err != nil {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 自动保存文件失败: %v", err))
-			} else {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已自动保存到文件: %s", filePath))
-			}
-			m.forceScrollBottom = true
+			m.pruneTrailingToolCallMessage()
 			m.updateChatView()
 			m.convMgr.Save()
+			if m.shouldSkipDuplicateToolCall(tc) {
+				return m, m.skipDuplicateToolCall(tc)
+			}
+			return m, m.startToolExecution(tc)
 		}
+
+		m.updateChatView()
+		m.convMgr.Save()
+
+		// 如果没有工具调用，尝试自动提取文件内容
+		if m.shouldAutoExtractSingleFile() {
+			if extracted, filePath, err := agent.AutoExtractFileContent(lastContent); extracted {
+				if err != nil {
+					current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 自动保存文件失败: %v", err))
+				} else {
+					m.noteTouchedFile(filePath)
+					current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已自动保存到文件: %s", filePath))
+				}
+				m.forceScrollBottom = true
+				m.updateChatView()
+				m.convMgr.Save()
+			}
+		}
+
+		if cmd := m.maybeContinueEngineeringToolFlow(lastContent); cmd != nil {
+			return m, cmd
+		}
+
+		if cmd := m.maybeRunForcedPostProcess(); cmd != nil {
+			return m, cmd
+		}
+
+		_ = completeTaskSpecHandoffIfNeeded(m.runtimePromptProfile, m.turnTouchedFiles, m.turnExecutedCommands, lastContent)
 
 		return m, nil
 	}
@@ -477,13 +620,49 @@ func (m *Model) resize() {
 	m.updateChatView()
 }
 
+func (m *Model) inputAreaHeight() int {
+	const (
+		inputBorderTop = 1
+		inputPaddingV  = 1
+		textareaLines  = 1
+	)
+	return inputBorderTop + inputPaddingV*2 + textareaLines
+}
+
+func (m *Model) hintAreaHeight() int {
+	if m.commandHintVisible {
+		return m.commandHintHeight()
+	}
+	return 0
+}
+
+func (m *Model) chatAreaHeight() int {
+	const (
+		statusH = 1
+		helpH   = 1
+	)
+	chatH := m.height - m.inputAreaHeight() - m.hintAreaHeight() - statusH - helpH
+	if chatH < 1 {
+		return 1
+	}
+	return chatH
+}
+
+func (m *Model) isChatAreaY(y int) bool {
+	return y >= 0 && y < m.chatAreaHeight()
+}
+
+func (m *Model) isInputZoneY(y int) bool {
+	start := m.chatAreaHeight()
+	end := start + m.hintAreaHeight() + m.inputAreaHeight()
+	return y >= start && y < end
+}
+
 func (m *Model) toggleFocus() {
 	if m.focus == focusInput {
-		m.focus = focusChat
-		m.textarea.Blur()
+		m.setFocusChat()
 	} else {
-		m.focus = focusInput
-		m.textarea.Focus()
+		m.setFocusInput()
 	}
 }
 
@@ -499,11 +678,42 @@ func (m *Model) sendMessage() tea.Cmd {
 
 	// 添加到输入历史记录（去重）
 	m.addToInputHistory(content)
+	m.selectRuntimePrompt(content)
+	state, stateErr := loadTaskSpecState()
+	awaitingApproval := stateErr == nil && state.Status == specStatusAwaitingApproval && state.Profile == runtimeProfileEngineering
+	if awaitingApproval && isExecutionApproval(content) {
+		m.runtimePromptProfile = runtimeProfileEngineering
+		m.runtimePromptSummary = loadRuntimePrompt(runtimeProfileEngineering)
+		_ = markTaskSpecApproved()
+	}
+	m.resetTurnAutomation(content)
 
 	current := m.convMgr.GetCurrent()
 	// 发送新消息前，清理之前的系统消息（命令输出等），保持界面整洁
 	m.clearSystemMessages()
 	current.AddMessage(conversation.RoleUser, content)
+
+	if shouldUseEngineeringPlanning(m.runtimePromptProfile, content) && !isExecutionApproval(content) {
+		if _, err := ensureTaskSpec(content, m.runtimePromptProfile); err != nil {
+			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 生成内部开发文档失败: %v", err))
+		} else {
+			current.AddMessage(conversation.RoleSystem, buildPlanningNotice(content))
+		}
+		m.textarea.SetValue("")
+		m.isStreaming = false
+		m.err = nil
+		m.dotsAnim = 0
+		m.inputHistoryIdx = len(m.inputHistory)
+		m.inputHistoryTemp = ""
+		m.forceScrollBottom = true
+		m.updateChatView()
+		m.convMgr.Save()
+		return nil
+	}
+
+	if awaitingApproval && isExecutionApproval(content) {
+		current.AddMessage(conversation.RoleSystem, "已确认 .freexclaw/spec 内部开发文档，开始按步骤执行。")
+	}
 	current.AddMessage(conversation.RoleAssistant, "")
 
 	m.textarea.SetValue("")
@@ -517,7 +727,7 @@ func (m *Model) sendMessage() tea.Cmd {
 
 	if tc := buildPreflightToolCall(content); tc != nil {
 		current.UpdateLastMessage(tcToTag(tc))
-		return m.executeToolAndContinue(tc)
+		return m.startToolExecution(tc)
 	}
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
@@ -529,8 +739,21 @@ func (m *Model) sendMessage() tea.Cmd {
 }
 
 func buildPreflightToolCall(content string) *agent.ToolCall {
+	if isProjectScaffoldRequest(content) {
+		return &agent.ToolCall{
+			Name: "list_dir",
+			Arguments: map[string]interface{}{
+				"path": ".",
+			},
+		}
+	}
+
 	match := tools.MatchLiveQuery(content, tools.GetCurrentLiveQueryContext())
 	if match.Domain == "generic_search" {
+		return nil
+	}
+
+	if match.Domain == "weather" && strings.TrimSpace(match.Location) == "" {
 		return nil
 	}
 
@@ -554,6 +777,11 @@ func tcToTag(tc *agent.ToolCall) string {
 			return fmt.Sprintf("<web_search>%s</web_search>", query)
 		}
 	}
+	if tc.Name == "list_dir" {
+		if path, ok := tc.Arguments["path"].(string); ok {
+			return fmt.Sprintf("<list_dir>%s</list_dir>", path)
+		}
+	}
 
 	return ""
 }
@@ -561,8 +789,12 @@ func tcToTag(tc *agent.ToolCall) string {
 func canonicalizePreflightQuery(content string, match tools.MatchResult) string {
 	if match.Domain == "weather" {
 		location := strings.TrimSpace(match.Location)
+		timeOfDay := strings.TrimSpace(match.TimeOfDay)
 		if location != "" && match.ForecastDays > 1 {
 			return fmt.Sprintf("%s %d天 天气预报", location, match.ForecastDays)
+		}
+		if location != "" && timeOfDay != "" {
+			return fmt.Sprintf("%s %s 天气", location, timeOfDay)
 		}
 		if location != "" {
 			return fmt.Sprintf("%s 实时天气", location)
@@ -587,7 +819,48 @@ func shouldHideToolResult(content string) bool {
 	if strings.Contains(resultContent, "错误:") {
 		return false
 	}
+	if strings.Contains(resultContent, "已跳过重复的 web_search 调用") {
+		return true
+	}
 	if strings.Contains(resultContent, "搜索关键词:") {
+		return true
+	}
+
+	return false
+}
+
+func shouldHideToolResultInContext(messages []conversation.Message, index int) bool {
+	if index < 0 || index >= len(messages) {
+		return false
+	}
+
+	content := messages[index].Content
+	if shouldHideToolResult(content) {
+		return true
+	}
+
+	resultContent := strings.TrimPrefix(content, "<|tool_result|>")
+	resultContent = strings.TrimSuffix(resultContent, "</|tool_result|>")
+	resultContent = strings.TrimSpace(resultContent)
+	if !strings.Contains(resultContent, "错误:") {
+		return false
+	}
+
+	for i := index + 1; i < len(messages); i++ {
+		msg := messages[i]
+		if msg.Role == conversation.RoleUser {
+			break
+		}
+		if msg.Role != conversation.RoleAssistant {
+			continue
+		}
+		assistantContent := strings.TrimSpace(msg.Content)
+		if assistantContent == "" {
+			continue
+		}
+		if agent.ParseToolCall(assistantContent) != nil {
+			continue
+		}
 		return true
 	}
 
@@ -849,6 +1122,24 @@ func (m *Model) buildMessages() []*schema.Message {
 		Role:    schema.System,
 		Content: agentPrompt,
 	})
+	if runtimeMsg := buildRuntimeSystemMessage(m.runtimePromptProfile, m.runtimePromptSummary); runtimeMsg != "" {
+		messages = append(messages, &schema.Message{
+			Role:    schema.System,
+			Content: runtimeMsg,
+		})
+	}
+	if deliveryMsg := buildDeliverySystemMessage(m.runtimePromptProfile, m.turnTouchedFiles, m.turnExecutedCommands); deliveryMsg != "" {
+		messages = append(messages, &schema.Message{
+			Role:    schema.System,
+			Content: deliveryMsg,
+		})
+	}
+	if specMsg := buildTaskSpecExecutionMessage(m.runtimePromptProfile); specMsg != "" {
+		messages = append(messages, &schema.Message{
+			Role:    schema.System,
+			Content: specMsg,
+		})
+	}
 
 	for i, msg := range current.Messages {
 		if i == len(current.Messages)-1 && msg.Role == conversation.RoleAssistant && msg.Content == "" {
@@ -872,6 +1163,18 @@ func (m *Model) buildMessages() []*schema.Message {
 	}
 
 	return messages
+}
+
+func (m *Model) selectRuntimePrompt(content string) {
+	profile := detectRuntimePromptProfile(content, m.convMgr.GetCurrent().Messages)
+	if profile == "" {
+		m.runtimePromptProfile = ""
+		m.runtimePromptSummary = ""
+		return
+	}
+
+	m.runtimePromptProfile = profile
+	m.runtimePromptSummary = loadRuntimePrompt(profile)
 }
 
 func (m *Model) updateChatView() {
@@ -917,7 +1220,7 @@ func (m *Model) updateChatView() {
 
 		// 工具结果消息（来自用户角色的 tool_result），美化显示
 		if msg.Role == conversation.RoleUser && strings.HasPrefix(content, "<|tool_result|>") && strings.HasSuffix(content, "</|tool_result|>") {
-			if shouldHideToolResult(content) {
+			if shouldHideToolResultInContext(current.Messages, i) {
 				continue
 			}
 			resultContent := strings.TrimPrefix(content, "<|tool_result|>")
@@ -1001,6 +1304,15 @@ func (m *Model) updateChatView() {
 		messages = append(messages, "")
 	}
 
+	if m.isToolRunning {
+		toolLine := "● 工具执行中"
+		if strings.TrimSpace(m.toolStatusText) != "" {
+			toolLine = "● " + m.toolStatusText
+		}
+		messages = append(messages, ThinkingStyle.Render(toolLine))
+		messages = append(messages, "")
+	}
+
 	fullContent := lipgloss.JoinVertical(lipgloss.Left, messages...)
 
 	// SetContent 之前记录用户是否在底部（内容变化后 AtBottom 会不准）
@@ -1023,6 +1335,8 @@ func (m *Model) renderInput() string {
 	var inputView string
 	if m.isStreaming {
 		inputView = PlaceholderStyle.Render("⏳ 正在生成回复... 按 Ctrl+C 停止")
+	} else if m.isToolRunning {
+		inputView = PlaceholderStyle.Render("⏳ 正在处理... 详见上方进度")
 	} else {
 		inputView = m.textarea.View()
 	}
@@ -1061,17 +1375,21 @@ func (m *Model) renderStatusBar() string {
 	}
 
 	status := strings.Join(parts, " │ ")
-	return StatusBarStyle.Width(m.width).Render(status)
+	return StatusBarStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(status)
 }
 
 func (m *Model) renderHelpBar() string {
 	var help string
 	if m.focus == focusInput {
-		help = "enter 发送 | shift+enter 换行 | esc 聊天区 | /help 帮助 | ctrl+c 退出"
+		if m.shouldQuitOnCtrlC() {
+			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | ctrl+c 再按退出"
+		} else {
+			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | ctrl+c 清空/退出"
+		}
 	} else {
-		help = "j/k 滚动 | ctrl+u/d 翻页 | g/G 顶/底 | esc 返回输入"
+		help = "j/k/滚轮 滚动 | ctrl+u/d 翻页 | g/G 顶/底 | 点击输入区返回输入"
 	}
-	return HelpStyle.Width(m.width).Render(help)
+	return HelpStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(help)
 }
 
 // updateCommandHint 根据输入框当前值更新命令提示面板状态，返回可见性是否有变化
@@ -1200,11 +1518,45 @@ func (m *Model) navigateHistory(direction int) {
 }
 
 // executeToolAndContinue 执行工具调用并启动下一轮流式生成
-func (m *Model) executeToolAndContinue(tc *agent.ToolCall) tea.Cmd {
-	current := m.convMgr.GetCurrent()
+func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
+	m.isToolRunning = true
+	m.toolStatusText = describeToolExecution(tc)
+	m.forceScrollBottom = true
+	m.updateChatView()
+	m.convMgr.Save()
+	m.toolCh = runToolAsync(tc)
+	return m.waitForToolEvent()
+}
 
-	// 执行工具
-	result := agent.ExecuteTool(tc)
+func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
+	current := m.convMgr.GetCurrent()
+	tc := msg.tc
+	result := msg.result
+	m.isToolRunning = false
+	m.toolStatusText = ""
+
+	if tc.Name == "run_command" {
+		m.turnSawRunCommand = true
+	}
+	if result.Success && (tc.Name == "write_file" || tc.Name == "append_file") {
+		if path, ok := tc.Arguments["path"].(string); ok {
+			m.noteTouchedFile(path)
+		}
+	}
+	if tc.Name == "run_command" {
+		if command, ok := tc.Arguments["command"].(string); ok {
+			m.noteExecutedCommand(command)
+		}
+	}
+	commandText, _ := tc.Arguments["command"].(string)
+	if !result.Success {
+		failureTarget := commandText
+		if failureTarget == "" && (tc.Name == "write_file" || tc.Name == "append_file") {
+			failureTarget, _ = tc.Arguments["path"].(string)
+		}
+		_ = recordTaskSpecFailure(tc.Name, failureTarget, result.Error)
+	}
+	_ = updateTaskSpecProgressForTool(tc.Name, result.Success, m.turnTouchedFiles, commandText)
 
 	// 将工具结果作为用户消息添加到对话中（以 tool_result 格式）
 	toolResultMsg := agent.BuildToolResultMessage(tc, result)
@@ -1225,5 +1577,226 @@ func (m *Model) executeToolAndContinue(tc *agent.ToolCall) tea.Cmd {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
+	return m, tea.Batch(m.waitForStream(), tickCmd())
+}
+
+func (m *Model) pruneTrailingToolCallMessage() {
+	current := m.convMgr.GetCurrent()
+	if len(current.Messages) == 0 {
+		return
+	}
+
+	last := current.Messages[len(current.Messages)-1]
+	if last.Role != conversation.RoleAssistant {
+		return
+	}
+	if agent.ParseToolCall(last.Content) == nil {
+		return
+	}
+
+	current.Messages = current.Messages[:len(current.Messages)-1]
+}
+
+func (m *Model) waitForToolEvent() tea.Cmd {
+	return func() tea.Msg {
+		if m.toolCh == nil {
+			return nil
+		}
+		msg, ok := <-m.toolCh
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+func (m *Model) resetTurnAutomation(prompt string) {
+	m.turnPrompt = prompt
+	m.turnTouchedFiles = nil
+	m.turnExecutedCommands = nil
+	m.turnSawRunCommand = false
+	m.turnEngineeringNudged = false
+	m.turnAutoPlanned = false
+	m.turnAutoToolQueue = nil
+}
+
+func (m *Model) shouldAutoExtractSingleFile() bool {
+	if strings.TrimSpace(m.runtimePromptProfile) == runtimeProfileEngineering && isProjectScaffoldRequest(m.turnPrompt) {
+		return false
+	}
+	return true
+}
+
+func (m *Model) maybeContinueEngineeringToolFlow(lastContent string) tea.Cmd {
+	if strings.TrimSpace(m.runtimePromptProfile) != runtimeProfileEngineering {
+		return nil
+	}
+	if !isProjectScaffoldRequest(m.turnPrompt) {
+		return nil
+	}
+	if m.turnEngineeringNudged || len(m.turnExecutedCommands) > 0 {
+		return nil
+	}
+	if strings.TrimSpace(lastContent) == "" {
+		return nil
+	}
+
+	hasSubstantiveFiles := hasSubstantiveProjectFiles(m.turnTouchedFiles)
+	if hasSubstantiveFiles {
+		return nil
+	}
+
+	current := m.convMgr.GetCurrent()
+	current.AddMessage(conversation.RoleSystem, "你还没有真正创建项目源码文件。当前如果只写了 package.json、tsconfig.json、nest-cli.json 这类清单/配置文件，仍然不算完成脚手架。请继续，仅使用 <list_dir>/<read_file>/<write_file>/<append_file>/<run_command> 工具，创建实际源码文件（例如 src/main.ts、src/app.module.ts、controller、service 等）和必要目录，不要重复改写同一个 package.json 或 tsconfig.json。")
+	current.AddMessage(conversation.RoleAssistant, "")
+	m.turnEngineeringNudged = true
+	m.isStreaming = true
+	m.err = nil
+	m.dotsAnim = 0
+	m.forceScrollBottom = true
+	m.updateChatView()
+	m.convMgr.Save()
+
+	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
+	messages := m.buildMessages()
+	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 	return tea.Batch(m.waitForStream(), tickCmd())
+}
+
+func (m *Model) noteTouchedFile(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(tools.GetWorkDir(), path)
+	}
+	path = filepath.Clean(path)
+	for _, existing := range m.turnTouchedFiles {
+		if strings.EqualFold(existing, path) {
+			return
+		}
+	}
+	m.turnTouchedFiles = append(m.turnTouchedFiles, path)
+}
+
+func (m *Model) noteExecutedCommand(command string) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return
+	}
+	for _, existing := range m.turnExecutedCommands {
+		if existing == command {
+			return
+		}
+	}
+	m.turnExecutedCommands = append(m.turnExecutedCommands, command)
+}
+
+func (m *Model) maybeRunForcedPostProcess() tea.Cmd {
+	if m.turnSawRunCommand {
+		return nil
+	}
+
+	if !m.turnAutoPlanned {
+		m.turnAutoPlanned = true
+		m.turnAutoToolQueue = buildForcedPostProcessToolCalls(m.turnPrompt, m.turnTouchedFiles)
+		if len(m.turnAutoToolQueue) > 0 {
+			current := m.convMgr.GetCurrent()
+			current.AddMessage(conversation.RoleSystem, "🛠️ 检测到项目生成任务，开始自动执行初始化与基础校验...")
+			m.forceScrollBottom = true
+			m.updateChatView()
+			m.convMgr.Save()
+		}
+	}
+
+	if len(m.turnAutoToolQueue) == 0 {
+		return nil
+	}
+
+	next := m.turnAutoToolQueue[0]
+	m.turnAutoToolQueue = m.turnAutoToolQueue[1:]
+	return m.startToolExecution(next)
+}
+
+func (m *Model) shouldSkipDuplicateToolCall(tc *agent.ToolCall) bool {
+	if tc == nil || tc.Name != "web_search" {
+		return false
+	}
+	query, _ := tc.Arguments["query"].(string)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return false
+	}
+
+	current := m.convMgr.GetCurrent()
+	for i := len(current.Messages) - 2; i >= 0; i-- {
+		msg := current.Messages[i]
+		if msg.Role == conversation.RoleUser &&
+			strings.HasPrefix(msg.Content, "<|tool_result|>") &&
+			!strings.Contains(msg.Content, "错误:") &&
+			strings.Contains(msg.Content, "搜索关键词: "+query) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) skipDuplicateToolCall(tc *agent.ToolCall) tea.Cmd {
+	current := m.convMgr.GetCurrent()
+	if len(current.Messages) > 0 {
+		last := current.Messages[len(current.Messages)-1]
+		if last.Role == conversation.RoleAssistant {
+			current.Messages = current.Messages[:len(current.Messages)-1]
+		}
+	}
+
+	current.AddMessage(conversation.RoleUser, "<|tool_result|>\n已跳过重复的 web_search 调用，请直接基于已有查询结果继续回答，不要再次调用相同查询。\n</|tool_result|>")
+	current.AddMessage(conversation.RoleAssistant, "")
+	m.isStreaming = true
+	m.err = nil
+	m.dotsAnim = 0
+	m.forceScrollBottom = true
+	m.updateChatView()
+	m.convMgr.Save()
+
+	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
+	messages := m.buildMessages()
+	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
+	return tea.Batch(m.waitForStream(), tickCmd())
+}
+
+func runToolAsync(tc *agent.ToolCall) <-chan tea.Msg {
+	ch := make(chan tea.Msg)
+	go func() {
+		defer close(ch)
+		result := agent.ExecuteToolWithProgress(tc, func(text string) {
+			ch <- toolProgressMsg{text: text}
+		})
+		ch <- toolExecutedMsg{tc: tc, result: result}
+	}()
+	return ch
+}
+
+func describeToolExecution(tc *agent.ToolCall) string {
+	if tc == nil {
+		return ""
+	}
+	switch tc.Name {
+	case "web_search":
+		if query, ok := tc.Arguments["query"].(string); ok && strings.TrimSpace(query) != "" {
+			return "正在查询：" + query
+		}
+		return "正在查询实时信息"
+	case "run_command":
+		if command, ok := tc.Arguments["command"].(string); ok && strings.TrimSpace(command) != "" {
+			return "正在执行命令：" + command
+		}
+		return "正在执行命令"
+	case "read_file", "write_file", "append_file", "list_dir":
+		if path, ok := tc.Arguments["path"].(string); ok && strings.TrimSpace(path) != "" {
+			return "正在处理：" + path
+		}
+	}
+	return "正在处理工具请求"
 }

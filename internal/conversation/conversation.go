@@ -287,6 +287,13 @@ func (m *Manager) List() []*Conversation {
 	return m.conversations
 }
 
+func (m *Manager) Close() error {
+	if m.db == nil {
+		return nil
+	}
+	return m.db.Close()
+}
+
 func (m *Manager) Delete(id string) {
 	for i, c := range m.conversations {
 		if c.ID == id {
