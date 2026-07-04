@@ -33,10 +33,10 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -66,7 +66,7 @@ jobs:
 
     steps:
       - name: Download built assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: dist
           merge-multiple: true
@@ -76,15 +76,11 @@ jobs:
           cd dist
           sha256sum * > checksums.txt
 
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: |
-          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
-            gh release upload "$TAG_NAME" dist/* --clobber
-          else
-            gh release create "$TAG_NAME" dist/* \
-              --title "freexclaw $TAG_NAME" \
-              --notes "Automated release for $TAG_NAME."
-          fi
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: freexclaw ${{ github.ref_name }}
+          body: Automated release for ${{ github.ref_name }}.
+          files: dist/*
+          fail_on_unmatched_files: true
