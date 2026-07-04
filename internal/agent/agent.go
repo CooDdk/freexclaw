@@ -25,6 +25,7 @@ var (
 	readFileRegex   = regexp.MustCompile(`<read_file>(.*?)</read_file>`)
 	listDirRegex    = regexp.MustCompile(`<list_dir>(.*?)</list_dir>`)
 	webSearchRegex  = regexp.MustCompile(`<web_search>\s*(.*?)\s*</web_search>`)
+	runCommandRegex = regexp.MustCompile(`<run_command>([\s\S]*?)</run_command>`)
 )
 
 func SystemPrompt() string {
@@ -44,6 +45,11 @@ func SystemPrompt() string {
 
 5. 列出目录：<list_dir>目录路径</list_dir>
 
+6. 执行命令：<run_command>
+可选第一行写 cwd: 相对目录
+后续写要执行的单次命令
+</run_command>
+
 ## 严格规则
 
 **当用户要求搜索、查询实时信息时，你必须使用 <web_search> 工具！**
@@ -52,7 +58,29 @@ func SystemPrompt() string {
 
 **当用户要求读取文件时，你必须使用 <read_file> 工具！**
 
+**当任务是“创建一个可运行的项目 / 服务 / 脚本”时，你不能只写单个源码文件就结束。你应该优先检查当前目录结构，补齐项目所需的配置文件、依赖声明和目录结构，并尽量自动完成初始化、安装依赖和基础校验。**
+
+**当你已经写完代码后，应继续使用 <run_command> 执行短时命令做验证，而不是停留在“请用户自行运行”。**
+
+**禁止使用 <run_command> 启动长期不退出的进程，例如 go run、npm run dev、vite、python app.py、uvicorn、flask run 等。你应该优先执行初始化、依赖安装、测试、静态检查、构建这类会结束的命令。**
+
+**如果命令失败，你应该根据错误继续修复文件或依赖，然后再次验证，直到得到一个尽量可运行、可通过基础检查的结果。**
+
 **工具调用必须单独占一行，前后要有空行。**
+
+## 创建项目时的默认工作流
+
+1. 先用 <list_dir> 查看当前目录，必要时用 <read_file> 读取已有配置。
+2. 生成项目时不要只写业务文件；要同时补齐必要的清单或配置文件。
+3. 写完文件后用 <run_command> 自动完成初始化和依赖安装。
+4. 再用 <run_command> 做最小验证，并根据结果继续修复。
+5. 最后明确告诉用户你实际执行过哪些命令、哪些检查通过了。
+
+## 常见语言的最低验证要求
+
+- Go：优先补齐 go.mod；常用命令包括 go mod init、go mod tidy、go test ./...、go vet ./...、go build ./...
+- Node.js：优先补齐 package.json；常用命令包括 npm init -y、npm install、npm test、npm run build
+- Python：优先补齐 requirements.txt 或 pyproject.toml；常用命令包括 pip install、pytest、python -m py_compile
 
 ## 正确示例
 
@@ -73,7 +101,31 @@ func SystemPrompt() string {
 用户：读取 main.go 的内容
 你：
 
-<read_file>main.go</read_file>`
+<read_file>main.go</read_file>
+
+用户：使用 gin 写一个简单 API 服务，并尽量帮我初始化和检查
+你：
+
+<list_dir>.</list_dir>
+
+（读取必要文件后继续）
+
+<write_file>main.go
+package main
+...
+</write_file>
+
+<run_command>
+go mod init gin-demo
+</run_command>
+
+<run_command>
+go mod tidy
+</run_command>
+
+<run_command>
+go test ./...
+</run_command>`
 }
 
 func ParseToolCall(content string) *ToolCall {
@@ -142,6 +194,34 @@ func ParseToolCall(content string) *ToolCall {
 		}
 	}
 
+	if matches := runCommandRegex.FindStringSubmatch(content); len(matches) >= 2 {
+		body := strings.TrimSpace(matches[1])
+		if body == "" {
+			return nil
+		}
+		cwd := ""
+		command := body
+		lines := strings.Split(body, "\n")
+		if len(lines) > 1 {
+			firstLine := strings.TrimSpace(lines[0])
+			switch {
+			case strings.HasPrefix(strings.ToLower(firstLine), "cwd:"):
+				cwd = strings.TrimSpace(firstLine[4:])
+				command = strings.TrimSpace(strings.Join(lines[1:], "\n"))
+			case strings.HasPrefix(firstLine, "目录:"):
+				cwd = strings.TrimSpace(strings.TrimPrefix(firstLine, "目录:"))
+				command = strings.TrimSpace(strings.Join(lines[1:], "\n"))
+			}
+		}
+		return &ToolCall{
+			Name: "run_command",
+			Arguments: map[string]interface{}{
+				"cwd":     cwd,
+				"command": command,
+			},
+		}
+	}
+
 	return nil
 }
 
@@ -157,6 +237,8 @@ func ExecuteTool(tc *ToolCall) ToolResult {
 		return executeListDir(tc.Arguments)
 	case "web_search":
 		return executeWebSearch(tc.Arguments)
+	case "run_command":
+		return executeRunCommand(tc.Arguments)
 	default:
 		return ToolResult{
 			Success: false,
@@ -222,6 +304,29 @@ func executeListDir(args map[string]interface{}) ToolResult {
 	return ToolResult{
 		Success: true,
 		Output:  sb.String(),
+	}
+}
+
+func executeRunCommand(args map[string]interface{}) ToolResult {
+	command, ok := args["command"].(string)
+	if !ok || strings.TrimSpace(command) == "" {
+		return ToolResult{Success: false, Error: "缺少 command 参数"}
+	}
+
+	cwd, _ := args["cwd"].(string)
+	result, err := tools.RunCommand(command, cwd)
+	output := tools.FormatCommandResult(result)
+	if err != nil {
+		return ToolResult{
+			Success: false,
+			Output:  output,
+			Error:   err.Error(),
+		}
+	}
+
+	return ToolResult{
+		Success: true,
+		Output:  output,
 	}
 }
 

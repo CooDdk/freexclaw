@@ -930,7 +930,7 @@ func (m *Model) updateChatView() {
 		}
 
 		// AI 消息中包含工具调用标记，美化显示
-		if msg.Role == conversation.RoleAssistant && (strings.Contains(content, "<write_file>") || strings.Contains(content, "<read_file>") || strings.Contains(content, "<list_dir>") || strings.Contains(content, "<append_file>") || strings.Contains(content, "<web_search>")) {
+		if msg.Role == conversation.RoleAssistant && (strings.Contains(content, "<write_file>") || strings.Contains(content, "<read_file>") || strings.Contains(content, "<list_dir>") || strings.Contains(content, "<append_file>") || strings.Contains(content, "<web_search>") || strings.Contains(content, "<run_command>")) {
 			tc := agent.ParseToolCall(content)
 			if tc != nil {
 				// 显示思考过程（工具调用之前的文本）和工具调用
@@ -942,6 +942,10 @@ func (m *Model) updateChatView() {
 				} else if tc.Name == "read_file" || tc.Name == "list_dir" {
 					if path, ok := tc.Arguments["path"].(string); ok {
 						display += fmt.Sprintf(" → %s", path)
+					}
+				} else if tc.Name == "run_command" {
+					if command, ok := tc.Arguments["command"].(string); ok {
+						display += fmt.Sprintf(" → %s", command)
 					}
 				}
 				messages = append(messages, AIPrefixStyle.Render("● ")+MessageContentStyle.Render(display))

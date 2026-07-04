@@ -16,8 +16,26 @@ func TestSystemPromptIncludesReadableWeatherInstructions(t *testing.T) {
 		"当用户的问题需要实时信息",
 		"<web_search>北京 今天 天气</web_search>",
 		"你必须使用 <web_search> 工具",
+		"<run_command>",
+		"go test ./...",
 	) {
 		t.Fatalf("system prompt should contain readable weather/tool instructions, got: %q", prompt)
+	}
+}
+
+func TestParseToolCall_RunCommand(t *testing.T) {
+	tc := ParseToolCall("<run_command>\ncwd: api\nnpm test\n</run_command>")
+	if tc == nil {
+		t.Fatal("expected run_command tool call")
+	}
+	if tc.Name != "run_command" {
+		t.Fatalf("expected run_command, got %q", tc.Name)
+	}
+	if got := tc.Arguments["cwd"]; got != "api" {
+		t.Fatalf("expected cwd api, got %#v", got)
+	}
+	if got := tc.Arguments["command"]; got != "npm test" {
+		t.Fatalf("expected command npm test, got %#v", got)
 	}
 }
 
