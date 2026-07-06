@@ -34,3 +34,30 @@ func TestRenderUserMessage_EmptyReturnsEmpty(t *testing.T) {
 		t.Fatalf("expected empty for empty input, got %q", got)
 	}
 }
+
+func TestRenderAssistantMessage_ContainsMarker(t *testing.T) {
+	got := renderAssistantMessage("Hello **world**", 80)
+	if !strings.Contains(got, "✻") {
+		t.Fatalf("expected ✻ marker, got %q", got)
+	}
+}
+
+func TestRenderAssistantMessage_EmptyReturnsEmpty(t *testing.T) {
+	if got := renderAssistantMessage("", 80); got != "" {
+		t.Fatalf("expected empty for empty input, got %q", got)
+	}
+}
+
+func TestRenderAssistantMessage_MultilineHasMarkerOnlyFirstLine(t *testing.T) {
+	got := renderAssistantMessage("line1\nline2", 80)
+	lines := strings.Split(got, "\n")
+	markerCount := 0
+	for _, l := range lines {
+		if strings.Contains(l, "✻") {
+			markerCount++
+		}
+	}
+	if markerCount != 1 {
+		t.Fatalf("expected marker on exactly 1 line, got %d in %q", markerCount, got)
+	}
+}
