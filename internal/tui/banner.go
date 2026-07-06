@@ -269,3 +269,9 @@ func (m *Model) renderSplash() string {
 
 	return strings.Join(lines, "\n")
 }
+
+// RenderBannerPublic is the exported entry point for renderBanner, used by cmd/main.go
+// to print the brand banner once before entering the Bubble Tea loop.
+func RenderBannerPublic(width int) string {
+	return renderBanner(width)
+}

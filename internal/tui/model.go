@@ -88,6 +88,18 @@ type splashEndMsg struct{}
 
 const ctrlCExitConfirmWindow = 2 * time.Second
 
+// ModelOptions carries runtime options for NewModel.
+type ModelOptions struct {
+	Splash bool
+}
+
+// pendingTool tracks a tool call currently being executed for spinner display.
+type pendingTool struct {
+	Name      string
+	Arguments map[string]any
+	StartedAt time.Time
+}
+
 type Model struct {
 	cfg          *config.Config
 	llmClient    *llm.Client
@@ -131,9 +143,19 @@ type Model struct {
 	turnAutoToolQueue  []*agent.ToolCall
 	ctrlCPrimedAt      time.Time
 	flashMessage       string
+	// P2 inline migration new fields (Task 7)
+	isThinking     bool
+	thinkingLabel  string
+	tokenCount     int
+	streamBuf      strings.Builder
+	spinnerTickN   int
+	activeToolCall *pendingTool
+	pickerActive   bool
+	picker         *sessionPicker
+	splashOpt      bool
 }
 
-func NewModel(cfg *config.Config) (*Model, error) {
+func NewModel(cfg *config.Config, opts ModelOptions) (*Model, error) {
 	llmClient, err := llm.NewClient(&llm.ClientConfig{
 		APIKey:  cfg.APIKey,
 		BaseURL: cfg.BaseURL,
@@ -166,9 +188,12 @@ func NewModel(cfg *config.Config) (*Model, error) {
 		textarea:    ta,
 		focus:       focusInput,
 		showHelp:    true,
-		showSplash:  true,
 		splashStage: 0,
 	}
+
+	m.splashOpt = opts.Splash
+	// Keep the legacy showSplash aligned with opt for now; Task 11 removes it entirely.
+	m.showSplash = opts.Splash
 
 	m.textarea.Focus()
 	m.updateChatView()
