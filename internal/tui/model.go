@@ -1170,6 +1170,9 @@ func (m *Model) stopStreaming() {
 		m.streamCancel()
 	}
 	m.isStreaming = false
+	m.isThinking = false
+	m.streamBuf.Reset()
+	m.tokenCount = 0
 }
 
 func (m *Model) buildMessages() []*schema.Message {
