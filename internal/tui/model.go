@@ -213,7 +213,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.resize()
+		m.textarea.SetWidth(msg.Width)
 		return m, nil
 
 	case splashTickMsg:
@@ -240,9 +240,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		if m.isStreaming {
+		if m.isThinking || m.activeToolCall != nil {
+			m.spinnerTickN++
+			return m, tickCmd()
+		}
+		if m.isStreaming { // legacy compatibility with old dotsAnim path — safe to keep during migration
 			m.dotsAnim++
-			m.updateChatView()
 			return m, tickCmd()
 		}
 		return m, nil
@@ -534,6 +537,7 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 
 	if msg.err != nil {
 		m.err = msg.err
+		m.isThinking = false
 		m.isStreaming = false
 		// 流式失败时，删除之前添加的空 assistant 消息，避免下次请求发送空消息给 API
 		if len(current.Messages) > 0 {
@@ -542,13 +546,24 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 				current.Messages = current.Messages[:len(current.Messages)-1]
 			}
 		}
+		m.streamBuf.Reset()
 		m.updateChatView()
 		m.convMgr.Save()
-		return m, nil
+		return m, tea.Println(MarkerWarn() + " 出错: " + msg.err.Error())
 	}
 
 	if msg.done {
+		m.isThinking = false
 		m.isStreaming = false
+		// 最终内容写回会话，供持久化使用
+		content := m.streamBuf.String()
+		m.streamBuf.Reset()
+		if len(current.Messages) > 0 {
+			last := &current.Messages[len(current.Messages)-1]
+			if last.Role == conversation.RoleAssistant {
+				last.Content = content
+			}
+		}
 		// 如果最终内容为空（模型返回空），删除这条空消息
 		if len(current.Messages) > 0 {
 			last := &current.Messages[len(current.Messages)-1]
@@ -574,6 +589,11 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 		m.updateChatView()
 		m.convMgr.Save()
 
+		var cmds []tea.Cmd
+		if trimmed := strings.TrimSpace(lastContent); trimmed != "" {
+			cmds = append(cmds, tea.Println(renderAssistantMessage(trimmed, m.width)))
+		}
+
 		// 如果没有工具调用，尝试自动提取文件内容
 		if m.shouldAutoExtractSingleFile() {
 			if extracted, filePath, err := agent.AutoExtractFileContent(lastContent); extracted {
@@ -590,21 +610,25 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 		}
 
 		if cmd := m.maybeContinueEngineeringToolFlow(lastContent); cmd != nil {
-			return m, cmd
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 		}
 
 		if cmd := m.maybeRunForcedPostProcess(); cmd != nil {
-			return m, cmd
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 		}
 
 		_ = completeTaskSpecHandoffIfNeeded(m.runtimePromptProfile, m.turnTouchedFiles, m.turnExecutedCommands, lastContent)
 
-		return m, nil
+		return m, tea.Batch(cmds...)
 	}
 
+	m.streamBuf.WriteString(msg.content)
+	m.tokenCount++
 	if len(current.Messages) > 0 {
 		last := &current.Messages[len(current.Messages)-1]
-		last.Content += msg.content
+		last.Content = m.streamBuf.String()
 		current.UpdatedAt = last.CreatedAt
 	}
 	m.updateChatView()
@@ -612,26 +636,7 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) View() string {
-	if m.width == 0 || m.height == 0 {
-		return "初始化中..."
-	}
-
-	if m.showSplash {
-		return m.renderSplash()
-	}
-
-	chat := m.renderChat()
-	input := m.renderInput()
-	status := m.renderStatusBar()
-	help := m.renderHelpBar()
-
-	parts := []string{chat}
-	if m.commandHintVisible {
-		parts = append(parts, m.renderCommandHint())
-	}
-	parts = append(parts, input, status, help)
-
-	return lipgloss.JoinVertical(lipgloss.Top, parts...)
+	return m.renderInline()
 }
 
 func (m *Model) resize() {
@@ -750,6 +755,7 @@ func (m *Model) sendMessage() tea.Cmd {
 	// 发送新消息前，清理之前的系统消息（命令输出等），保持界面整洁
 	m.clearSystemMessages()
 	current.AddMessage(conversation.RoleUser, content)
+	userLine := renderUserMessage(content)
 
 	if shouldUseEngineeringPlanning(m.runtimePromptProfile, content) && !isExecutionApproval(content) {
 		if _, err := ensureTaskSpec(content, m.runtimePromptProfile); err != nil {
@@ -766,7 +772,7 @@ func (m *Model) sendMessage() tea.Cmd {
 		m.forceScrollBottom = true
 		m.updateChatView()
 		m.convMgr.Save()
-		return nil
+		return tea.Println(userLine)
 	}
 
 	if awaitingApproval && isExecutionApproval(content) {
@@ -785,7 +791,7 @@ func (m *Model) sendMessage() tea.Cmd {
 
 	if tc := buildPreflightToolCall(content); tc != nil {
 		current.UpdateLastMessage(tcToTag(tc))
-		return m.startToolExecution(tc)
+		return tea.Sequence(tea.Println(userLine), m.startToolExecution(tc))
 	}
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
@@ -793,7 +799,12 @@ func (m *Model) sendMessage() tea.Cmd {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
-	return tea.Batch(m.waitForStream(), tickCmd())
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
+
+	return tea.Sequence(tea.Println(userLine), tea.Batch(m.waitForStream(), tickCmd()))
 }
 
 func buildPreflightToolCall(content string) *agent.ToolCall {
@@ -1914,15 +1925,16 @@ func (m *Model) renderToolCallLine() string {
 // a gradient rule on top and an icon-separated info line below.
 func (m *Model) renderStatusBarInline() string {
 	sep := " │ "
-	sess := m.convMgr.GetCurrent()
 	title := "会话1"
 	msgCount := 0
-	if sess != nil {
-		title = sess.Title
-		if title == "" {
-			title = "会话1"
+	if m.convMgr != nil {
+		if sess := m.convMgr.GetCurrent(); sess != nil {
+			title = sess.Title
+			if title == "" {
+				title = "会话1"
+			}
+			msgCount = len(sess.Messages)
 		}
-		msgCount = len(sess.Messages)
 	}
 	modelName := ""
 	if m.cfg != nil {
