@@ -2,6 +2,7 @@ package tui
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -310,5 +311,89 @@ func TestHandleMouseMsg_WheelOnInputAreaNavigatesHistory(t *testing.T) {
 	}
 	if got.textarea.Value() != "second" {
 		t.Fatalf("expected latest history item, got %q", got.textarea.Value())
+	}
+}
+
+func TestRenderHelpBar_ChatFocusShowsCopyHints(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+		focus:    focusChat,
+		width:    120,
+	}
+	defer m.convMgr.Close()
+
+	help := m.renderHelpBar()
+	if !strings.Contains(help, "y 复制最后回复") {
+		t.Fatalf("expected y copy hint, got %q", help)
+	}
+	if !strings.Contains(help, "shift+拖拽 复制") {
+		t.Fatalf("expected shift+drag hint, got %q", help)
+	}
+	if !strings.Contains(help, "点击/esc 返回输入") {
+		t.Fatalf("expected return-to-input hint, got %q", help)
+	}
+}
+
+func TestCopyLastAssistantMessage_CopiesLatestNonEmptyAssistant(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+		focus:    focusChat,
+	}
+	defer m.convMgr.Close()
+
+	current := m.convMgr.GetCurrent()
+	current.AddMessage(conversation.RoleUser, "hi")
+	current.AddMessage(conversation.RoleAssistant, "第一次回答")
+	current.AddMessage(conversation.RoleUser, "再问一次")
+	current.AddMessage(conversation.RoleAssistant, "最新回答内容")
+
+	var copied string
+	origCopy := copyToClipboard
+	copyToClipboard = func(s string) error {
+		copied = s
+		return nil
+	}
+	defer func() { copyToClipboard = origCopy }()
+
+	m.copyLastAssistantMessage()
+
+	if copied != "最新回答内容" {
+		t.Fatalf("expected latest assistant content copied, got %q", copied)
+	}
+	if !strings.Contains(m.flashMessage, "已复制") {
+		t.Fatalf("expected copy confirmation in flash message, got %q", m.flashMessage)
+	}
+}
+
+func TestCopyLastAssistantMessage_NoMessageFlashesWarning(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+		focus:    focusChat,
+	}
+	defer m.convMgr.Close()
+
+	origCopy := copyToClipboard
+	copyToClipboard = func(s string) error {
+		t.Fatalf("clipboard should not be called when nothing to copy")
+		return nil
+	}
+	defer func() { copyToClipboard = origCopy }()
+
+	m.copyLastAssistantMessage()
+
+	if m.flashMessage != "没有可复制的消息" {
+		t.Fatalf("expected empty-message flash, got %q", m.flashMessage)
 	}
 }

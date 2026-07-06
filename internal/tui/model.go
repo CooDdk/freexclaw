@@ -14,6 +14,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cloudwego/eino/schema"
+	"github.com/atotto/clipboard"
 
 	"github.com/CooDdk/freexclaw/internal/agent"
 	"github.com/CooDdk/freexclaw/internal/config"
@@ -28,6 +29,8 @@ const (
 	focusInput focusState = iota
 	focusChat
 )
+
+var copyToClipboard = clipboard.WriteAll
 
 // commandItem 定义一个斜杠命令
 type commandItem struct {
@@ -127,6 +130,7 @@ type Model struct {
 	turnAutoPlanned    bool
 	turnAutoToolQueue  []*agent.ToolCall
 	ctrlCPrimedAt      time.Time
+	flashMessage       string
 }
 
 func NewModel(cfg *config.Config) (*Model, error) {
@@ -303,6 +307,7 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() != "ctrl+c" {
 		m.clearCtrlCExitState()
 	}
+	m.flashMessage = ""
 
 	switch msg.String() {
 	case "ctrl+c":
@@ -464,11 +469,39 @@ func (m *Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "G":
 		m.viewport.GotoBottom()
 		return m, nil
+	case "y":
+		m.copyLastAssistantMessage()
+		return m, nil
 	default:
 		m.focus = focusInput
 		m.textarea.Focus()
 		return m, nil
 	}
+}
+
+func (m *Model) copyLastAssistantMessage() {
+	current := m.convMgr.GetCurrent()
+	if current == nil {
+		m.flashMessage = "没有可复制的消息"
+		return
+	}
+	for i := len(current.Messages) - 1; i >= 0; i-- {
+		msg := current.Messages[i]
+		if msg.Role != conversation.RoleAssistant {
+			continue
+		}
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		if err := copyToClipboard(content); err != nil {
+			m.flashMessage = fmt.Sprintf("复制失败: %v", err)
+			return
+		}
+		m.flashMessage = fmt.Sprintf("已复制 %d 字符", len([]rune(content)))
+		return
+	}
+	m.flashMessage = "没有可复制的消息"
 }
 
 func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
@@ -1374,6 +1407,11 @@ func (m *Model) renderStatusBar() string {
 		parts = append(parts, errInfo)
 	}
 
+	if m.flashMessage != "" {
+		flash := lipgloss.NewStyle().Foreground(lipgloss.Color("#86EFAC")).Render(m.flashMessage)
+		parts = append(parts, flash)
+	}
+
 	status := strings.Join(parts, " │ ")
 	return StatusBarStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(status)
 }
@@ -1382,12 +1420,12 @@ func (m *Model) renderHelpBar() string {
 	var help string
 	if m.focus == focusInput {
 		if m.shouldQuitOnCtrlC() {
-			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | ctrl+c 再按退出"
+			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | shift+拖拽 复制 | ctrl+c 再按退出"
 		} else {
-			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | ctrl+c 清空/退出"
+			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | shift+拖拽 复制 | ctrl+c 清空/退出"
 		}
 	} else {
-		help = "j/k/滚轮 滚动 | ctrl+u/d 翻页 | g/G 顶/底 | 点击输入区返回输入"
+		help = "j/k/滚轮 滚动 | ctrl+u/d 翻页 | g/G 顶/底 | y 复制最后回复 | shift+拖拽 复制 | 点击/esc 返回输入"
 	}
 	return HelpStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(help)
 }
