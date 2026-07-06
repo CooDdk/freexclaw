@@ -812,7 +812,10 @@ func (m *Model) sendMessage() tea.Cmd {
 
 	if tc := buildPreflightToolCall(content); tc != nil {
 		current.UpdateLastMessage(tcToTag(tc))
-		return tea.Sequence(tea.Println(userLine), m.startToolExecution(tc))
+		return tea.Sequence(
+			tea.Println(userLine),
+			tea.Batch(m.startToolExecution(tc), tickCmd()),
+		)
 	}
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
@@ -1173,6 +1176,8 @@ func (m *Model) stopStreaming() {
 	m.isThinking = false
 	m.streamBuf.Reset()
 	m.tokenCount = 0
+	m.activeToolCall = nil
+	m.isToolRunning = false
 }
 
 func (m *Model) buildMessages() []*schema.Message {
@@ -1607,7 +1612,7 @@ func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
 	m.updateChatView()
 	m.convMgr.Save()
 	m.toolCh = runToolAsync(tc)
-	return tea.Batch(m.waitForToolEvent(), tickCmd())
+	return m.waitForToolEvent()
 }
 
 func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
@@ -1678,7 +1683,7 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
-	continueCmd := tea.Batch(m.waitForStream(), tickCmd())
+	continueCmd := m.waitForStream()
 	if toolLine == "" {
 		return m, continueCmd
 	}
@@ -1769,7 +1774,7 @@ func (m *Model) maybeContinueEngineeringToolFlow(lastContent string) tea.Cmd {
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
-	return tea.Batch(m.waitForStream(), tickCmd())
+	return m.waitForStream()
 }
 
 func (m *Model) noteTouchedFile(path string) {
@@ -1876,7 +1881,7 @@ func (m *Model) skipDuplicateToolCall(tc *agent.ToolCall) tea.Cmd {
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
-	return tea.Batch(m.waitForStream(), tickCmd())
+	return m.waitForStream()
 }
 
 func runToolAsync(tc *agent.ToolCall) <-chan tea.Msg {
