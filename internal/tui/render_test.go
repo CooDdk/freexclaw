@@ -3,6 +3,9 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/CooDdk/freexclaw/internal/config"
+	"github.com/CooDdk/freexclaw/internal/conversation"
 )
 
 func TestRenderUserMessage_ContainsMarkerAndText(t *testing.T) {
@@ -121,5 +124,24 @@ func TestFormatToolDuration_BoundaryAt1000(t *testing.T) {
 	}
 	if got := formatToolDuration(1000); got != "1.0s" {
 		t.Fatalf("1.0s expected, got %q", got)
+	}
+}
+
+func TestRenderStatusBarInline_ContainsBrand(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	m := &Model{
+		cfg:     &config.Config{Model: "test-model"},
+		convMgr: conversation.NewManager(root),
+		width:   120,
+	}
+	defer m.convMgr.Close()
+
+	bar := m.renderStatusBarInline()
+	if !strings.Contains(bar, "FreeX Claw") {
+		t.Fatalf("missing brand: %q", bar)
+	}
+	if !strings.Contains(bar, "test-model") {
+		t.Fatalf("missing model name: %q", bar)
 	}
 }

@@ -1863,3 +1863,103 @@ func describeToolExecution(tc *agent.ToolCall) string {
 	}
 	return "正在处理工具请求"
 }
+
+// renderInline is the new inline scrollback View renderer. It renders only the
+// currently-active UI (textarea, spinner, tool line, status bar). Historical
+// messages are pushed to scrollback via tea.Println by callers.
+// NOT YET WIRED to View(); Task 9 does the switch.
+func (m *Model) renderInline() string {
+	if m.pickerActive && m.picker != nil {
+		return m.picker.View() + "\n" + m.renderStatusBarInline()
+	}
+
+	var parts []string
+	parts = append(parts, m.textarea.View())
+
+	if m.isThinking {
+		parts = append(parts, m.renderSpinnerLine())
+	}
+	if m.activeToolCall != nil {
+		parts = append(parts, m.renderToolCallLine())
+	}
+	parts = append(parts, m.renderStatusBarInline())
+	return strings.Join(parts, "\n")
+}
+
+func (m *Model) renderSpinnerLine() string {
+	frame := BrandSpinnerFrames[m.spinnerTickN%len(BrandSpinnerFrames)]
+	label := m.thinkingLabel
+	if label == "" {
+		label = "思考中"
+	}
+	return lipgloss.NewStyle().Foreground(AssistantColor).Bold(true).Render(frame) +
+		" " + label + "... " +
+		lipgloss.NewStyle().Foreground(MutedColor).Faint(true).
+			Render(fmt.Sprintf("(%d tokens)", m.tokenCount))
+}
+
+func (m *Model) renderToolCallLine() string {
+	if m.activeToolCall == nil {
+		return ""
+	}
+	frame := BrandSpinnerFrames[m.spinnerTickN%len(BrandSpinnerFrames)]
+	args := formatToolArgs(m.activeToolCall.Arguments)
+	head := fmt.Sprintf("%s %s(%s)", MarkerToolStart(), m.activeToolCall.Name, args)
+	sub := fmt.Sprintf("  %s 执行中...",
+		lipgloss.NewStyle().Foreground(AssistantColor).Render(frame))
+	return head + "\n" + sub
+}
+
+// renderStatusBarInline draws the branded two-line status bar:
+// a gradient rule on top and an icon-separated info line below.
+func (m *Model) renderStatusBarInline() string {
+	sep := " │ "
+	sess := m.convMgr.GetCurrent()
+	title := "会话1"
+	msgCount := 0
+	if sess != nil {
+		title = sess.Title
+		if title == "" {
+			title = "会话1"
+		}
+		msgCount = len(sess.Messages)
+	}
+	modelName := ""
+	if m.cfg != nil {
+		modelName = m.cfg.Model
+	}
+	parts := []string{
+		MarkerAssistant() + " FreeX Claw",
+		modelName,
+		fmt.Sprintf("📁 %s (%d条)", title, msgCount),
+		"/help",
+	}
+	info := StatusBarStyle.Render(strings.Join(parts, sep))
+
+	lineW := m.width
+	if lineW <= 0 {
+		lineW = 80
+	}
+	gradient := renderGradientLine(lineW)
+	return gradient + "\n" + info
+}
+
+// renderGradientLine draws a horizontal rule using a two-color simple gradient
+// (UserColor → AssistantColor) over the given width using the ▔ glyph.
+func renderGradientLine(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	mid := width / 2
+	userStyle := lipgloss.NewStyle().Foreground(UserColor)
+	assistStyle := lipgloss.NewStyle().Foreground(AssistantColor)
+	chars := make([]string, width)
+	for i := 0; i < width; i++ {
+		if i < mid {
+			chars[i] = userStyle.Render("▔")
+		} else {
+			chars[i] = assistStyle.Render("▔")
+		}
+	}
+	return strings.Join(chars, "")
+}
