@@ -262,6 +262,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toolExecutedMsg:
 		return m.handleToolExecuted(msg)
 
+	case sessionPickerSelectedMsg:
+		m.pickerActive = false
+		m.picker = nil
+		m.convMgr.SetCurrent(msg.ID)
+		m.convMgr.Save()
+		title := "未命名"
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			title = cur.Title
+		}
+		return m, tea.Println(fmt.Sprintf("%s → 已切换到 %q", MarkerAssistant(), title))
+
+	case sessionPickerCancelledMsg:
+		m.pickerActive = false
+		m.picker = nil
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
 
@@ -325,6 +341,11 @@ func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.pickerActive && m.picker != nil {
+		var cmd tea.Cmd
+		m.picker, cmd = m.picker.Update(msg)
+		return m, cmd
+	}
 	if m.showSplash {
 		m.showSplash = false
 		m.forceScrollBottom = true
@@ -942,6 +963,18 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		return nil
 	}
 
+	var cmds []tea.Cmd
+	emit := func(s string) {
+		cmds = append(cmds, tea.Println(s))
+	}
+
+	// Always clear the input textarea at the end of a command
+	defer func() {
+		m.textarea.SetValue("")
+		m.commandHintVisible = false
+		m.commandHintIndex = 0
+	}()
+
 	current := m.convMgr.GetCurrent()
 
 	switch parts[0] {
@@ -973,81 +1006,60 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
   /write -a log.txt 追加内容 - 追加到文件
   /ls                    - 列出当前目录
   /ls src/               - 列出 src 目录`
-		current.AddMessage(conversation.RoleSystem, helpText)
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(helpText)
 
 	case "/clear":
 		current.Messages = nil
 		m.err = nil
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(MarkerAssistant() + " 已清空当前会话")
 
 	case "/new":
 		m.convMgr.NewConversation()
 		m.convMgr.Save()
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(MarkerAssistant() + " 已新建会话")
 
 	case "/save":
 		if err := m.convMgr.Save(); err != nil {
 			m.err = err
+			emit(MarkerToolFail() + " 保存失败: " + err.Error())
 		} else {
-			current.AddMessage(conversation.RoleSystem, "✓ 对话已保存")
+			emit(MarkerToolOK() + " 对话已保存")
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/sessions":
-		convs := m.convMgr.List()
-		if len(convs) == 0 {
-			current.AddMessage(conversation.RoleSystem, "暂无会话")
-		} else {
-			var sb strings.Builder
-			curID := m.convMgr.GetCurrent().ID
-			sb.WriteString(fmt.Sprintf("会话列表 (共 %d 个):\n", len(convs)))
-			for i, c := range convs {
-				marker := "  "
-				if c.ID == curID {
-					marker = "▶ "
-				}
-				sb.WriteString(fmt.Sprintf("%s[%d] %s (%d 条消息) %s\n",
-					marker, i+1, c.Title, len(c.Messages),
-					c.UpdatedAt.Format("2006-01-02 15:04")))
-			}
-			sb.WriteString("\n输入 /open <序号> 进入指定会话")
-			current.AddMessage(conversation.RoleSystem, sb.String())
+		items := make([]pickerItem, 0)
+		curID := ""
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			curID = cur.ID
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
+		for _, c := range m.convMgr.List() {
+			items = append(items, pickerItemFromConversation(c, c.ID == curID))
+		}
+		m.picker = newSessionPicker(items)
+		m.pickerActive = true
 
 	case "/open":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /open <序号>\n输入 /sessions 查看会话列表")
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /open <序号>（输入 /sessions 查看会话列表）")
 			break
 		}
 		idx, err := strconv.Atoi(parts[1])
 		if err != nil || idx < 1 {
-			current.AddMessage(conversation.RoleSystem, "序号必须是正整数")
-			m.updateChatView()
+			emit(MarkerToolFail() + " 序号必须是正整数")
 			break
 		}
 		convs := m.convMgr.List()
 		if idx > len(convs) {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("序号超出范围，共 %d 个会话", len(convs)))
-			m.updateChatView()
+			emit(MarkerToolFail() + fmt.Sprintf(" 序号超出范围，共 %d 个会话", len(convs)))
 			break
 		}
-		m.convMgr.SetCurrent(convs[idx-1].ID)
-		m.forceScrollBottom = true
-		m.updateChatView()
+		target := convs[idx-1]
+		m.convMgr.SetCurrent(target.ID)
+		emit(MarkerAssistant() + fmt.Sprintf(" → 已切换到 %q", target.Title))
 
 	case "/rename":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /rename <新名称>\n示例: /rename Python 脚本开发")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /rename <新名称>（示例: /rename Python 脚本开发）")
 			break
 		}
 		newTitle := strings.Join(parts[1:], " ")
@@ -1056,60 +1068,49 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		current.Title = newTitle
 		current.UpdatedAt = time.Now()
 		if err := m.convMgr.Save(); err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 重命名失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 重命名失败: %v", err))
 		} else {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✓ 会话已重命名: %q → %q", oldTitle, newTitle))
+			emit(MarkerAssistant() + fmt.Sprintf(" 会话已重命名: %q → %q", oldTitle, newTitle))
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/read":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /read <文件路径>\n示例: /read main.go")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /read <文件路径>（示例: /read main.go）")
 			break
 		}
 		path := strings.Join(parts[1:], " ")
 		fc, err := tools.ReadFile(path)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 读取失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 读取失败: %v", err))
 		} else {
 			current.AddMessage(conversation.RoleUser, fmt.Sprintf("请分析这个文件的内容:\n\n%s", tools.FormatFileContent(fc)))
+			emit(MarkerToolOK() + " 已读取 " + path + "（内容已加入下一轮上下文）")
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/write":
 		if len(parts) < 3 {
-			current.AddMessage(conversation.RoleSystem, "用法: /write <文件路径> <内容>\n示例: /write hello.txt Hello World\n使用 -a 参数追加: /write -a log.txt 新内容")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /write <文件路径> <内容>（示例: /write hello.txt Hello World；使用 -a 追加）")
 			break
 		}
 		args := strings.Join(parts[1:], " ")
 		path, content, appendMode, err := tools.ParseWriteArgs(args)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 参数错误: %v", err))
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + fmt.Sprintf(" 参数错误: %v", err))
 			break
 		}
 		if err := tools.WriteFile(path, content+"\n", appendMode); err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 写入失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 写入失败: %v", err))
 		} else {
 			if appendMode {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已追加到 %s", path))
+				emit(MarkerToolOK() + fmt.Sprintf(" 已追加到 %s", path))
 			} else {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已写入 %s", path))
+				emit(MarkerToolOK() + fmt.Sprintf(" 已写入 %s", path))
 			}
 			// 读取刚写入的文件，方便继续编辑
 			if fc, readErr := tools.ReadFile(path); readErr == nil {
 				current.AddMessage(conversation.RoleUser, fmt.Sprintf("文件内容已更新，继续编辑:\n\n%s", tools.FormatFileContent(fc)))
 			}
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/ls":
 		path := "."
@@ -1118,35 +1119,34 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		}
 		files, err := tools.ListDir(path)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 读取目录失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 读取目录失败: %v", err))
 		} else {
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("📂 目录: %s\n", path))
+			sb.WriteString(MarkerAssistant() + fmt.Sprintf(" 目录: %s\n", path))
 			for _, f := range files {
 				sb.WriteString("  " + f + "\n")
 			}
 			if len(files) == 0 {
 				sb.WriteString("  (空目录)\n")
 			}
-			current.AddMessage(conversation.RoleSystem, sb.String())
+			emit(strings.TrimRight(sb.String(), "\n"))
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/quit":
 		m.convMgr.Save()
 		return tea.Quit
 
 	default:
-		current.AddMessage(conversation.RoleSystem, fmt.Sprintf("未知命令: %s\n输入 /help 查看可用命令", parts[0]))
-		m.updateChatView()
+		emit(MarkerToolFail() + fmt.Sprintf(" 未知命令: %s（输入 /help 查看可用命令）", parts[0]))
 	}
 
-	m.textarea.SetValue("")
-	m.commandHintVisible = false
-	m.commandHintIndex = 0
-	m.resize()
-	return nil
+	if len(cmds) == 0 {
+		return nil
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return tea.Sequence(cmds...)
 }
 
 func (m *Model) waitForStream() tea.Cmd {
@@ -1598,11 +1598,16 @@ func (m *Model) navigateHistory(direction int) {
 func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
 	m.isToolRunning = true
 	m.toolStatusText = describeToolExecution(tc)
+	m.activeToolCall = &pendingTool{
+		Name:      tc.Name,
+		Arguments: tc.Arguments,
+		StartedAt: time.Now(),
+	}
 	m.forceScrollBottom = true
 	m.updateChatView()
 	m.convMgr.Save()
 	m.toolCh = runToolAsync(tc)
-	return m.waitForToolEvent()
+	return tea.Batch(m.waitForToolEvent(), tickCmd())
 }
 
 func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
@@ -1611,6 +1616,21 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	result := msg.result
 	m.isToolRunning = false
 	m.toolStatusText = ""
+
+	// Capture display info from activeToolCall BEFORE clearing
+	var toolLine string
+	if m.activeToolCall != nil {
+		durationMS := int(time.Since(m.activeToolCall.StartedAt) / time.Millisecond)
+		summary := result.Output
+		if !result.Success && result.Error != "" {
+			summary = result.Error
+		}
+		if len(summary) > 200 {
+			summary = summary[:200] + "..."
+		}
+		toolLine = renderToolCall(m.activeToolCall.Name, m.activeToolCall.Arguments, summary, result.Success, durationMS)
+	}
+	m.activeToolCall = nil
 
 	if tc.Name == "run_command" {
 		m.turnSawRunCommand = true
@@ -1643,6 +1663,10 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	current.AddMessage(conversation.RoleAssistant, "")
 
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
 	m.dotsAnim = 0
 	m.forceScrollBottom = true
@@ -1654,7 +1678,11 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
-	return m, tea.Batch(m.waitForStream(), tickCmd())
+	continueCmd := tea.Batch(m.waitForStream(), tickCmd())
+	if toolLine == "" {
+		return m, continueCmd
+	}
+	return m, tea.Sequence(tea.Println(toolLine), continueCmd)
 }
 
 func (m *Model) pruneTrailingToolCallMessage() {
@@ -1728,6 +1756,10 @@ func (m *Model) maybeContinueEngineeringToolFlow(lastContent string) tea.Cmd {
 	current.AddMessage(conversation.RoleAssistant, "")
 	m.turnEngineeringNudged = true
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
 	m.dotsAnim = 0
 	m.forceScrollBottom = true
@@ -1831,6 +1863,10 @@ func (m *Model) skipDuplicateToolCall(tc *agent.ToolCall) tea.Cmd {
 	current.AddMessage(conversation.RoleUser, "<|tool_result|>\n已跳过重复的 web_search 调用，请直接基于已有查询结果继续回答，不要再次调用相同查询。\n</|tool_result|>")
 	current.AddMessage(conversation.RoleAssistant, "")
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
 	m.dotsAnim = 0
 	m.forceScrollBottom = true
