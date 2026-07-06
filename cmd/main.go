@@ -1,10 +1,12 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 
 	"github.com/CooDdk/freexclaw/internal/config"
 	"github.com/CooDdk/freexclaw/internal/tools"
@@ -12,6 +14,9 @@ import (
 )
 
 func main() {
+	splashEnabled := flag.Bool("splash", false, "启用启动动画（默认关闭）")
+	flag.Parse()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 获取当前目录失败: %v\n", err)
@@ -42,13 +47,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	model, err := tui.NewModel(cfg)
+	// Print brand banner once (into scrollback)
+	width := 80
+	if w, _, terr := term.GetSize(int(os.Stdout.Fd())); terr == nil && w > 0 {
+		width = w
+	}
+	fmt.Println(tui.RenderBannerPublic(width))
+	fmt.Println()
+
+	model, err := tui.NewModel(cfg, tui.ModelOptions{Splash: *splashEnabled})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 初始化界面失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Inline rendering: no alt-screen, no mouse capture.
+	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 运行失败: %v\n", err)
 		os.Exit(1)
