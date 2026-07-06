@@ -12,6 +12,9 @@ var (
 	UserColor      = lipgloss.Color("#A78BFA")
 	AssistantColor = lipgloss.Color("#22D3EE")
 	ErrorColor     = lipgloss.Color("#EF4444")
+	ToolColor      = lipgloss.Color("#F97316")
+	WarnColor      = lipgloss.Color("#FBBF24")
+	OKColor        = lipgloss.Color("#10B981")
 )
 
 var (
@@ -41,7 +44,7 @@ var (
 				PaddingLeft(2)
 
 	ToolResultStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#10B981")).
+				Foreground(OKColor).
 				PaddingLeft(2)
 
 	ThinkingStyle = lipgloss.NewStyle().
@@ -73,7 +76,7 @@ var (
 				Padding(0, 1)
 
 	CommandHintSelectedItemStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("#FBBF24")).
+					Foreground(WarnColor).
 					Bold(true)
 
 	CommandHintItemStyle = lipgloss.NewStyle().

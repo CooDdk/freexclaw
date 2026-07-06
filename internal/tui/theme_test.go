@@ -48,3 +48,9 @@ func TestMarkerToolFail_ContainsCross(t *testing.T) {
 		t.Fatalf("expected MarkerToolFail to contain ✗, got %q", MarkerToolFail())
 	}
 }
+
+func TestMarkerWarn_ContainsSymbol(t *testing.T) {
+	if !strings.Contains(MarkerWarn(), "⚠") {
+		t.Fatalf("expected MarkerWarn to contain ⚠, got %q", MarkerWarn())
+	}
+}
