@@ -20,9 +20,6 @@ var (
 var (
 	AppStyle = lipgloss.NewStyle()
 
-	ChatViewStyle = lipgloss.NewStyle().
-			Padding(1, 2)
-
 	InputAreaStyle = lipgloss.NewStyle().
 			Border(lipgloss.NormalBorder(), true, false, false, false).
 			BorderForeground(BorderColor).
