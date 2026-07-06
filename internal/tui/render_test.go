@@ -61,3 +61,38 @@ func TestRenderAssistantMessage_MultilineHasMarkerOnlyFirstLine(t *testing.T) {
 		t.Fatalf("expected marker on exactly 1 line, got %d in %q", markerCount, got)
 	}
 }
+
+func TestRenderToolCall_SuccessHasStartAndOK(t *testing.T) {
+	got := renderToolCall("web_search",
+		map[string]interface{}{"query": "武汉 天气"},
+		"3 个结果",
+		true, 800)
+	if !strings.Contains(got, "▸") {
+		t.Fatalf("missing ▸: %q", got)
+	}
+	if !strings.Contains(got, "✓") {
+		t.Fatalf("missing ✓: %q", got)
+	}
+	if !strings.Contains(got, "web_search") {
+		t.Fatalf("missing tool name: %q", got)
+	}
+	if !strings.Contains(got, "武汉") {
+		t.Fatalf("missing arg: %q", got)
+	}
+	if !strings.Contains(got, "0.8s") && !strings.Contains(got, "800ms") {
+		t.Fatalf("missing duration: %q", got)
+	}
+}
+
+func TestRenderToolCall_FailureHasCross(t *testing.T) {
+	got := renderToolCall("web_search",
+		map[string]interface{}{"query": "x"},
+		"错误: 网络超时",
+		false, 1200)
+	if !strings.Contains(got, "✗") {
+		t.Fatalf("expected ✗ marker on failure, got %q", got)
+	}
+	if !strings.Contains(got, "网络超时") {
+		t.Fatalf("expected error text, got %q", got)
+	}
+}
