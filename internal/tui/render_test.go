@@ -96,3 +96,30 @@ func TestRenderToolCall_FailureHasCross(t *testing.T) {
 		t.Fatalf("expected error text, got %q", got)
 	}
 }
+
+func TestFormatToolArgs_NonStringNotQuoted(t *testing.T) {
+	got := formatToolArgs(map[string]any{
+		"recursive": true,
+		"count":     42,
+		"path":      ".",
+	})
+	// keys are sorted alphabetically
+	if !strings.Contains(got, "count=42") {
+		t.Fatalf("expected count=42 (unquoted), got %q", got)
+	}
+	if !strings.Contains(got, "recursive=true") {
+		t.Fatalf("expected recursive=true (unquoted), got %q", got)
+	}
+	if !strings.Contains(got, `path="."`) {
+		t.Fatalf("expected path=\".\" (quoted), got %q", got)
+	}
+}
+
+func TestFormatToolDuration_BoundaryAt1000(t *testing.T) {
+	if got := formatToolDuration(999); got != "999ms" {
+		t.Fatalf("999ms expected, got %q", got)
+	}
+	if got := formatToolDuration(1000); got != "1.0s" {
+		t.Fatalf("1.0s expected, got %q", got)
+	}
+}

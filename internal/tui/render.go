@@ -32,7 +32,7 @@ func renderUserMessage(text string) string {
 // resultSummary: single- or multi-line result summary
 // ok: success flag
 // durationMS: elapsed time in milliseconds
-func renderToolCall(name string, args map[string]interface{}, resultSummary string, ok bool, durationMS int) string {
+func renderToolCall(name string, args map[string]any, resultSummary string, ok bool, durationMS int) string {
 	argStr := formatToolArgs(args)
 	var status string
 	if ok {
@@ -50,7 +50,7 @@ func renderToolCall(name string, args map[string]interface{}, resultSummary stri
 	return head + "\n" + tail
 }
 
-func formatToolArgs(args map[string]interface{}) string {
+func formatToolArgs(args map[string]any) string {
 	if len(args) == 0 {
 		return ""
 	}
@@ -62,7 +62,12 @@ func formatToolArgs(args map[string]interface{}) string {
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		v := args[k]
-		parts = append(parts, fmt.Sprintf("%s=%q", k, fmt.Sprint(v)))
+		switch vv := v.(type) {
+		case string:
+			parts = append(parts, fmt.Sprintf("%s=%q", k, vv))
+		default:
+			parts = append(parts, fmt.Sprintf("%s=%v", k, vv))
+		}
 	}
 	return strings.Join(parts, ", ")
 }
