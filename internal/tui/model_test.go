@@ -2,11 +2,15 @@ package tui
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/CooDdk/freexclaw/internal/agent"
+	"github.com/CooDdk/freexclaw/internal/config"
 	"github.com/CooDdk/freexclaw/internal/conversation"
 	"github.com/CooDdk/freexclaw/internal/tools"
+	"github.com/charmbracelet/bubbles/textarea"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestBuildPreflightToolCall_SkipsWeatherWithoutLocation(t *testing.T) {
@@ -154,5 +158,93 @@ func TestHasSubstantiveProjectFiles_SourceFileCounts(t *testing.T) {
 	}
 	if !hasSubstantiveProjectFiles(paths) {
 		t.Fatal("expected source files to count as substantive project files")
+	}
+}
+
+func TestHandleKeyMsg_CtrlCArmsAndQuits(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	ta.SetValue("hello")
+	m := &Model{
+		cfg:      &config.Config{Model: "test"},
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+	}
+	defer m.convMgr.Close()
+
+	model, cmd := m.handleKeyMsg(tea.KeyMsg{Type: tea.KeyCtrlC})
+	got := model.(*Model)
+	if cmd != nil {
+		t.Fatal("first ctrl+c should not quit")
+	}
+	if got.textarea.Value() != "" {
+		t.Fatalf("expected input cleared, got %q", got.textarea.Value())
+	}
+	if got.ctrlCPrimedAt.IsZero() {
+		t.Fatal("expected ctrl+c exit to be armed")
+	}
+
+	_, cmd = got.handleKeyMsg(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatal("second ctrl+c should return quit cmd")
+	}
+}
+
+func TestSessionsCommand_ActivatesPicker(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		cfg:      &config.Config{Model: "test"},
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+	}
+	defer m.convMgr.Close()
+
+	m.handleCommand("/sessions")
+	if !m.pickerActive {
+		t.Fatal("expected pickerActive after /sessions")
+	}
+	if m.picker == nil {
+		t.Fatal("expected picker instance to be constructed")
+	}
+}
+
+func TestViewInline_ContainsStatusBar(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		cfg:      &config.Config{Model: "test-model"},
+		convMgr:  conversation.NewManager(root),
+		textarea: ta,
+		width:    120,
+	}
+	defer m.convMgr.Close()
+
+	v := m.View()
+	if !strings.Contains(v, "FreeX Claw") {
+		t.Fatalf("expected status bar brand in View, got: %q", v)
+	}
+}
+
+func TestViewInline_ThinkingRendersSpinner(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	ta := textarea.New()
+	m := &Model{
+		cfg:           &config.Config{Model: "test"},
+		convMgr:       conversation.NewManager(root),
+		textarea:      ta,
+		width:         120,
+		isThinking:    true,
+		thinkingLabel: "思考中",
+	}
+	defer m.convMgr.Close()
+
+	v := m.View()
+	if !strings.Contains(v, "思考中") {
+		t.Fatalf("expected 思考中 label in View when isThinking, got: %q", v)
 	}
 }
