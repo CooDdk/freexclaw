@@ -9,6 +9,17 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
+// 表格渲染参数：
+//   - minTableColWidth：单元格内容区最小宽度。原来是 10（≈5 个汉字），
+//     一到 3 列表格就会把中文强制拆成竖排；提到 16（≈8 个汉字）后
+//     常见中文列可以完整成词显示。
+//   - tableCellPadX：单元格内容左右各留的空格数。之前只有 1，看着很闷；
+//     改为 2 让表格更透气。
+const (
+	minTableColWidth = 16
+	tableCellPadX    = 2
+)
+
 var (
 	tableRowRegex        = regexp.MustCompile(`^\s*\|(.+)\|\s*$`)
 	tableSeparatorRegex  = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$`)
@@ -111,7 +122,13 @@ func renderMarkdown(content string, width int) string {
 		if isTableStart(lines, i) {
 			tableLines, skip := extractTable(lines, i)
 			if len(tableLines) >= 2 {
-				rendered := renderTable(tableLines, contentWidth)
+				// AI 消息渲染时每行会加 2 空格缩进，再留 2 空格作为右侧呼吸，
+				// 避免表格贴到终端右边缘或被缩进推溢出。
+				tableWidth := contentWidth - 4
+				if tableWidth < minTableColWidth+tableCellPadX*2+2 {
+					tableWidth = minTableColWidth + tableCellPadX*2 + 2
+				}
+				rendered := renderTable(tableLines, tableWidth)
 				result = append(result, rendered)
 				result = append(result, "")
 				i += skip
@@ -549,38 +566,8 @@ func renderTable(tableLines []string, maxWidth int) string {
 		}
 	}
 
-	colWidths := make([]int, numCols)
-	for _, row := range rows {
-		for j, cell := range row {
-			cellPlain := stripInlineMarkdown(cell)
-			w := runewidth.StringWidth(cellPlain)
-			if w > colWidths[j] {
-				colWidths[j] = w
-			}
-		}
-	}
-
-	totalWidth := 1
-	for _, w := range colWidths {
-		totalWidth += w + 3
-	}
-
-	if totalWidth > maxWidth && numCols > 1 {
-		excess := totalWidth - maxWidth
-		for excess > 0 {
-			widestIdx := 0
-			for i := 1; i < numCols; i++ {
-				if colWidths[i] > colWidths[widestIdx] {
-					widestIdx = i
-				}
-			}
-			if colWidths[widestIdx] <= 10 {
-				break
-			}
-			colWidths[widestIdx]--
-			excess--
-		}
-	}
+	colWidths := computeTableColWidths(rows, maxWidth)
+	numCols = len(colWidths)
 
 	headerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#FBBF24")).
@@ -594,7 +581,7 @@ func renderTable(tableLines []string, maxWidth int) string {
 
 	topBorder := borderStyle.Render("┌")
 	for j := 0; j < numCols; j++ {
-		topBorder += borderStyle.Render(strings.Repeat("─", colWidths[j]+2))
+		topBorder += borderStyle.Render(strings.Repeat("─", colWidths[j]+tableCellPadX*2))
 		if j < numCols-1 {
 			topBorder += borderStyle.Render("┬")
 		}
@@ -627,7 +614,8 @@ func renderTable(tableLines []string, maxWidth int) string {
 				if padding < 0 {
 					padding = 0
 				}
-				padded := " " + cellText + strings.Repeat(" ", padding+1)
+				pad := strings.Repeat(" ", tableCellPadX)
+				padded := pad + cellText + strings.Repeat(" ", padding+tableCellPadX)
 
 				if rowIdx == 0 && separatorIdx >= 0 {
 					padded = headerStyle.Render(padded)
@@ -643,7 +631,7 @@ func renderTable(tableLines []string, maxWidth int) string {
 		if rowIdx == 0 && separatorIdx >= 0 {
 			sepLine := borderStyle.Render("├")
 			for j := 0; j < numCols; j++ {
-				sepLine += borderStyle.Render(strings.Repeat("─", colWidths[j]+2))
+				sepLine += borderStyle.Render(strings.Repeat("─", colWidths[j]+tableCellPadX*2))
 				if j < numCols-1 {
 					sepLine += borderStyle.Render("┼")
 				}
@@ -655,7 +643,7 @@ func renderTable(tableLines []string, maxWidth int) string {
 
 	bottomBorder := borderStyle.Render("└")
 	for j := 0; j < numCols; j++ {
-		bottomBorder += borderStyle.Render(strings.Repeat("─", colWidths[j]+2))
+		bottomBorder += borderStyle.Render(strings.Repeat("─", colWidths[j]+tableCellPadX*2))
 		if j < numCols-1 {
 			bottomBorder += borderStyle.Render("┴")
 		}
@@ -664,6 +652,55 @@ func renderTable(tableLines []string, maxWidth int) string {
 	result = append(result, bottomBorder)
 
 	return strings.Join(result, "\n")
+}
+
+// computeTableColWidths 根据每列内容的可视宽度确定列宽，
+// 超出 maxWidth 时循环缩减最宽的列，但最小不低于 minTableColWidth
+// （保证中文列至少能容纳约 8 个汉字，不至于被强制拆成竖排）。
+func computeTableColWidths(rows [][]string, maxWidth int) []int {
+	if len(rows) == 0 {
+		return nil
+	}
+	numCols := 0
+	for _, row := range rows {
+		if len(row) > numCols {
+			numCols = len(row)
+		}
+	}
+	colWidths := make([]int, numCols)
+	for _, row := range rows {
+		for j, cell := range row {
+			w := runewidth.StringWidth(stripInlineMarkdown(cell))
+			if w > colWidths[j] {
+				colWidths[j] = w
+			}
+		}
+	}
+
+	// 每列真实占用 = colWidths[j] + tableCellPadX*2（左右 padding）
+	// 分隔字符 │ 每列后各占 1，总宽度 = 左边框 1 + Σ(colWidth + padding*2 + 1)
+	totalWidth := 1
+	for _, w := range colWidths {
+		totalWidth += w + tableCellPadX*2 + 1
+	}
+
+	if totalWidth > maxWidth && numCols > 1 {
+		excess := totalWidth - maxWidth
+		for excess > 0 {
+			widestIdx := 0
+			for i := 1; i < numCols; i++ {
+				if colWidths[i] > colWidths[widestIdx] {
+					widestIdx = i
+				}
+			}
+			if colWidths[widestIdx] <= minTableColWidth {
+				break
+			}
+			colWidths[widestIdx]--
+			excess--
+		}
+	}
+	return colWidths
 }
 
 func wrapText(text string, maxWidth int) []string {

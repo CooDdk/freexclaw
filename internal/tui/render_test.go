@@ -176,6 +176,36 @@ func TestRenderMarkdown_NoLeadingOrTrailingBlank(t *testing.T) {
 	}
 }
 
+func TestComputeTableColWidths_HonorsMinColWidthForNarrowTerminals(t *testing.T) {
+	// 第一列自然宽度约 30，明显超过窄终端能容纳的量。压缩循环应把它缩短，
+	// 但不能低于 minTableColWidth，否则中文会被强制拆行。
+	rows := [][]string{
+		{"这是一段挺长的中文表头文字项目", "情况"},
+		{"补一行让内容再长点也放不下下下下下下下下下", "OK"},
+	}
+	widths := computeTableColWidths(rows, 20)
+	if len(widths) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(widths))
+	}
+	if widths[0] < minTableColWidth {
+		t.Fatalf("col 0 compressed to %d, below floor %d", widths[0], minTableColWidth)
+	}
+}
+
+func TestComputeTableColWidths_UsesNaturalWidthWhenFits(t *testing.T) {
+	rows := [][]string{
+		{"a", "bb"},
+		{"c", "d"},
+	}
+	widths := computeTableColWidths(rows, 80)
+	if widths[0] != 1 {
+		t.Fatalf("col 0: expected natural width 1, got %d", widths[0])
+	}
+	if widths[1] != 2 {
+		t.Fatalf("col 1: expected natural width 2, got %d", widths[1])
+	}
+}
+
 func TestRenderInputDividerInline_ContainsLabel(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("APPDATA", root)
