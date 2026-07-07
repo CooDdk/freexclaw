@@ -1,14 +1,12 @@
 # P2 Inline Rendering Migration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** 把 FreeX Claw 从 alt-screen 全屏 TUI 迁移到 inline scrollback 渲染，解决 Windows Terminal 状态条消失问题，同时保留 LOGO/品牌视觉。
 
 **Architecture:** 移除 `tea.WithAltScreen()` 与 `tea.WithMouseCellMotion()`。Bubble Tea 的 View() 帧只渲染输入区 + spinner + 状态条，历史通过 `tea.Println()` 打进 scrollback。品牌视觉靠大 LOGO banner + 品牌符号（❯ ✻ ▸ ⚠）+ 定制 spinner 帧维持。
 
 **Tech Stack:** Go 1.25 · Bubble Tea v1.3.10 · Bubbles (textarea, spinner) · Lipgloss · atotto/clipboard
 
-**Reference spec:** `docs/superpowers/specs/2026-07-06-p2-inline-rendering-design.md`
+**Reference spec:** `docs/design/2026-07-06-p2-inline-rendering-design.md`
 
 **Working branch:** `feat/inline-rendering`（在开始 Task 1 前创建：`git checkout -b feat/inline-rendering`）
 
@@ -1576,10 +1574,10 @@ git commit -m "test(tui): rewrite model tests for inline architecture"
 - [ ] **Step 6: 打 tag & 合并**
 
 ```bash
-# 找迁移前最后一个 commit 并打 tag（在 feat/inline-rendering 分支起点的父 commit）
-git log master --oneline -1  # 记住这个 SHA
-git tag v1.0-preinline <SHA>
-git tag v1.1-inline HEAD
+# 项目实际走 0.x semver（v0.1.3 是 pre-inline 的 latest release）。
+# 本分支合并后打下一位 patch 或 minor，例如 v0.1.4。
+git tag v0.1.3-preinline master   # 可选：给 pre-inline 顶点起个别名，便于回滚
+git tag v0.1.4 HEAD               # 合并后打在 master 上，触发 release workflow
 ```
 
 （如果这是 PR 流程，改为在 PR 描述里贴对比截图/录屏。）
