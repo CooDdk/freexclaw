@@ -77,6 +77,8 @@ type ModelOptions struct {
 	// ResumeID, if non-empty, tells NewModel to resume the given session ID
 	// instead of starting a fresh empty conversation.
 	ResumeID string
+	// Yolo disables per-invocation confirm on run_command. Off by default.
+	Yolo bool
 }
 
 // pendingTool tracks a tool call currently being executed for spinner display.
@@ -127,6 +129,10 @@ type Model struct {
 	activeToolCall *pendingTool
 	pickerActive   bool
 	picker         *sessionPicker
+	// run_command confirm 门槛：非 Yolo 模式下，run_command 先被这里挡住，
+	// 等用户按 y 才真正执行。
+	pendingConfirm *pendingCommandConfirm
+	yolo           bool
 }
 
 func NewModel(cfg *config.Config, opts ModelOptions) (*Model, error) {
@@ -156,6 +162,7 @@ func NewModel(cfg *config.Config, opts ModelOptions) (*Model, error) {
 		llmClient: llmClient,
 		convMgr:   conversation.NewManager(tools.GetWorkDir()),
 		textarea:  ta,
+		yolo:      opts.Yolo,
 	}
 
 	// Session policy: default to a fresh empty conversation on each launch,
@@ -278,6 +285,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.pendingConfirm != nil {
+		return m.handleCommandConfirmKey(msg)
+	}
 	if m.pickerActive && m.picker != nil {
 		var cmd tea.Cmd
 		m.picker, cmd = m.picker.Update(msg)
@@ -1252,6 +1262,16 @@ func (m *Model) navigateHistory(direction int) {
 
 // executeToolAndContinue 执行工具调用并启动下一轮流式生成
 func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
+	// 非 Yolo 模式下，run_command 先挂起等待用户按 y/n 确认。
+	if needsCommandConfirm(tc, m.yolo) {
+		m.pendingConfirm = &pendingCommandConfirm{tc: tc}
+		return tea.Println(renderCommandConfirmPrompt(tc))
+	}
+	return m.doStartToolExecution(tc)
+}
+
+// doStartToolExecution 是绕过 confirm 的真正执行入口。
+func (m *Model) doStartToolExecution(tc *agent.ToolCall) tea.Cmd {
 	m.isToolRunning = true
 	m.toolStatusText = describeToolExecution(tc)
 	m.activeToolCall = &pendingTool{
@@ -1262,6 +1282,29 @@ func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
 	m.convMgr.Save()
 	m.toolCh = runToolAsync(tc)
 	return m.waitForToolEvent()
+}
+
+// handleCommandConfirmKey 在 pendingConfirm 激活时接管键盘：
+// y/Y 放行、n/N/esc 拒绝，其余键忽略保持提示。
+func (m *Model) handleCommandConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	pc := m.pendingConfirm
+	if pc == nil {
+		return m, nil
+	}
+	switch msg.String() {
+	case "y", "Y":
+		m.pendingConfirm = nil
+		return m, m.doStartToolExecution(pc.tc)
+	case "n", "N", "esc":
+		m.pendingConfirm = nil
+		rejected := commandRejectedResult()
+		tc := pc.tc
+		return m, tea.Batch(
+			tea.Println(SystemMessageStyle.Render("✗ 已拒绝执行该命令")),
+			func() tea.Msg { return toolExecutedMsg{tc: tc, result: rejected} },
+		)
+	}
+	return m, nil
 }
 
 func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
