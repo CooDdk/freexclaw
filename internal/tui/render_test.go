@@ -166,3 +166,44 @@ func TestRenderMarkdown_NoLeadingOrTrailingBlank(t *testing.T) {
 		t.Fatalf("expected no trailing blank, got: %q", rendered)
 	}
 }
+
+func TestRenderInputDividerInline_ContainsLabel(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	m := &Model{
+		cfg:     &config.Config{Model: "test"},
+		convMgr: conversation.NewManager(root),
+		width:   80,
+	}
+	defer m.convMgr.Close()
+
+	div := m.renderInputDividerInline()
+	if !strings.Contains(div, "✎ 输入") {
+		t.Fatalf("expected 输入 label in divider, got %q", div)
+	}
+	if !strings.Contains(div, "─") {
+		t.Fatalf("expected rule glyph in divider, got %q", div)
+	}
+	if !strings.Contains(div, "╭") {
+		t.Fatalf("expected corner glyph in divider, got %q", div)
+	}
+}
+
+func TestRenderInputDividerInline_NarrowTerminalFallsBackToPlainRule(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("APPDATA", root)
+	m := &Model{
+		cfg:     &config.Config{Model: "test"},
+		convMgr: conversation.NewManager(root),
+		width:   6,
+	}
+	defer m.convMgr.Close()
+
+	div := m.renderInputDividerInline()
+	if strings.Contains(div, "✎") {
+		t.Fatalf("expected label to be dropped in narrow terminal, got %q", div)
+	}
+	if !strings.Contains(div, "─") {
+		t.Fatalf("expected plain rule glyphs, got %q", div)
+	}
+}

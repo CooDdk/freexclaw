@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cloudwego/eino/schema"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/CooDdk/freexclaw/internal/agent"
 	"github.com/CooDdk/freexclaw/internal/config"
@@ -1566,6 +1567,7 @@ func (m *Model) renderInline() string {
 	}
 
 	var parts []string
+	parts = append(parts, m.renderInputDividerInline())
 	parts = append(parts, m.textarea.View())
 
 	if hint := m.renderCommandHintInline(); hint != "" {
@@ -1579,6 +1581,28 @@ func (m *Model) renderInline() string {
 	}
 	parts = append(parts, m.renderStatusBarInline())
 	return strings.Join(parts, "\n")
+}
+
+// renderInputDividerInline draws a subtle labeled rule above the textarea so
+// the input zone is visually separated from the scrollback message area.
+// Format: `╭─ ✎ 输入 ──────────────────────────`
+func (m *Model) renderInputDividerInline() string {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	label := " ✎ 输入 "
+	prefix := "╭─"
+	ruleStyle := lipgloss.NewStyle().Foreground(MutedColor).Faint(true)
+	labelStyle := lipgloss.NewStyle().Foreground(UserColor).Bold(true)
+	labelW := runewidth.StringWidth(label)
+	prefixW := runewidth.StringWidth(prefix)
+	remain := w - prefixW - labelW
+	if remain < 0 {
+		// Terminal too narrow — fall back to a plain rule.
+		return ruleStyle.Render(strings.Repeat("─", w))
+	}
+	return ruleStyle.Render(prefix) + labelStyle.Render(label) + ruleStyle.Render(strings.Repeat("─", remain))
 }
 
 // renderCommandHintInline draws the slash-command completion dropdown just below

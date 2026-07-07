@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -82,16 +83,26 @@ func main() {
 	}
 }
 
-// resumeCommandName returns the invocation name used in the resume hint.
-// Uses os.Args[0] basename so it reflects however the user installed the
-// binary (e.g. renamed to `fx`). The .exe suffix is stripped for readability.
+// resumeCommandName returns the invocation string used in the resume hint.
+// Strategy: if the binary is resolvable on PATH (matches the running executable
+// after symlink resolution), return its basename so the hint is short and works
+// in the user's shell. Otherwise fall back to the absolute path so the hint is
+// verbose but always runnable.
 func resumeCommandName() string {
-	name := filepath.Base(os.Args[0])
-	if ext := filepath.Ext(name); strings.EqualFold(ext, ".exe") {
-		name = strings.TrimSuffix(name, ext)
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		exe = os.Args[0]
 	}
-	if name == "" || name == "." {
+	if exe == "" {
 		return "freexclaw"
 	}
-	return name
+	base := filepath.Base(exe)
+	if resolved, lerr := exec.LookPath(base); lerr == nil {
+		a, e1 := filepath.EvalSymlinks(resolved)
+		b, e2 := filepath.EvalSymlinks(exe)
+		if e1 == nil && e2 == nil && strings.EqualFold(a, b) {
+			return base
+		}
+	}
+	return exe
 }
