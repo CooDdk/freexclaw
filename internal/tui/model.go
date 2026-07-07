@@ -1613,11 +1613,15 @@ func (m *Model) renderInline() string {
 
 	// 状态指示放在输入框上方（消息内容区域末尾），这样用户能明显看到
 	// 自己刚发出的指令正在被处理，而不是把 spinner 藏在输入框下面。
-	if m.isThinking {
-		parts = append(parts, m.renderSpinnerLine())
-	}
-	if m.activeToolCall != nil {
-		parts = append(parts, m.renderToolCallLine())
+	// 前面加一空行，跟上方 scrollback 里的用户消息拉开距离，不至于紧贴。
+	if m.isThinking || m.activeToolCall != nil {
+		parts = append(parts, "")
+		if m.isThinking {
+			parts = append(parts, m.renderSpinnerLine())
+		}
+		if m.activeToolCall != nil {
+			parts = append(parts, m.renderToolCallLine())
+		}
 	}
 
 	// 输入区上方留一行空白，让消息内容区域和输入框有清晰的视觉距离。
