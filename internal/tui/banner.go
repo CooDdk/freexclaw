@@ -16,9 +16,8 @@ const (
 ██║     ██║  ██║███████╗███████╗██╔╝ ██╗╚██████╗███████╗██║  ██║╚███╔███╔╝
 ╚═╝     ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝`
 
-	subTitleBig = " Terminal AI Programming Assistant"
-	tagline     = "  智能终端 AI 助手 · 聊天 · 编程 · 搜索 · 写文档"
-	version     = "v0.1.0"
+	subTitleBig = "Terminal AI Programming Assistant"
+	version     = "v0.1.3"
 )
 
 func renderBanner(width int) string {
@@ -36,18 +35,34 @@ func renderBanner(width int) string {
 
 	bannerLines := strings.Split(strings.TrimLeft(bannerBig, "\n"), "\n")
 
-	topDecor := "╭──────────────────────────────────────────────────────────╮"
-	if width < 80 {
-		topDecor = "╭──────────────────────────────────────╮"
+	// Frame width tracks the widest banner line so the ╭─╮ / ╰─╯ rules
+	// visually enclose the ASCII art rather than floating above/below it.
+	bannerW := 0
+	for _, l := range bannerLines {
+		if w := runewidth.StringWidth(l); w > bannerW {
+			bannerW = w
+		}
 	}
-	decorW := runewidth.StringWidth(topDecor)
-	decorPad := (width - decorW) / 2
-	if decorPad > 0 {
-		topDecor = strings.Repeat(" ", decorPad) + topDecor
+	frameW := bannerW
+	if frameW > width-2 && width > 12 {
+		frameW = width - 2
+	}
+	if frameW < 12 {
+		frameW = 12
 	}
 
 	decorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6D28D9"))
-	lines = append(lines, decorStyle.Render(topDecor))
+	centerPad := func(s string) string {
+		w := runewidth.StringWidth(s)
+		pad := (width - w) / 2
+		if pad > 0 {
+			return strings.Repeat(" ", pad) + s
+		}
+		return s
+	}
+
+	topDecor := "╭" + strings.Repeat("─", frameW-2) + "╮"
+	lines = append(lines, decorStyle.Render(centerPad(topDecor)))
 	lines = append(lines, "")
 
 	for i, line := range bannerLines {
@@ -56,12 +71,7 @@ func renderBanner(width int) string {
 			colorIdx = len(colors) - 1
 		}
 		style := lipgloss.NewStyle().Foreground(colors[colorIdx]).Bold(true)
-		lineW := runewidth.StringWidth(line)
-		pad := (width - lineW) / 2
-		if pad > 0 {
-			line = strings.Repeat(" ", pad) + line
-		}
-		lines = append(lines, style.Render(line))
+		lines = append(lines, style.Render(centerPad(line)))
 	}
 
 	lines = append(lines, "")
@@ -69,49 +79,18 @@ func renderBanner(width int) string {
 	accentStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#F472B6")).
 		Bold(true)
-	verW := runewidth.StringWidth(version)
-	verPad := (width - verW) / 2
-	verLine := version
-	if verPad > 0 {
-		verLine = strings.Repeat(" ", verPad) + version
-	}
-	lines = append(lines, accentStyle.Render(verLine))
+	verLine := "── freex claw · " + version + " ──"
+	lines = append(lines, accentStyle.Render(centerPad(verLine)))
 
 	lines = append(lines, "")
 
-	subStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#C4B5FD"))
-	subW := runewidth.StringWidth(subTitleBig)
-	subPad := (width - subW) / 2
-	subLine := subTitleBig
-	if subPad > 0 {
-		subLine = strings.Repeat(" ", subPad) + subTitleBig
-	}
-	lines = append(lines, subStyle.Render(subLine))
-
-	tagStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#818CF8")).
-		Italic(true)
-	tagW := runewidth.StringWidth(tagline)
-	tagPad := (width - tagW) / 2
-	tagLine := tagline
-	if tagPad > 0 {
-		tagLine = strings.Repeat(" ", tagPad) + tagline
-	}
-	lines = append(lines, tagStyle.Render(tagLine))
+	subStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#C4B5FD"))
+	lines = append(lines, subStyle.Render(centerPad(subTitleBig)))
 
 	lines = append(lines, "")
 
-	bottomDecor := "╰──────────────────────────────────────────────────────────╯"
-	if width < 80 {
-		bottomDecor = "╰──────────────────────────────────────╯"
-	}
-	bottomW := runewidth.StringWidth(bottomDecor)
-	bottomPad := (width - bottomW) / 2
-	if bottomPad > 0 {
-		bottomDecor = strings.Repeat(" ", bottomPad) + bottomDecor
-	}
-	lines = append(lines, decorStyle.Render(bottomDecor))
+	bottomDecor := "╰" + strings.Repeat("─", frameW-2) + "╯"
+	lines = append(lines, decorStyle.Render(centerPad(bottomDecor)))
 
 	return strings.Join(lines, "\n")
 }
