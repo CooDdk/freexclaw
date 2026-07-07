@@ -49,6 +49,42 @@ func TestBuildToolResultMessage_UsesErrorWhenOutputEmpty(t *testing.T) {
 	}
 }
 
+func TestParseToolCall_EditFile(t *testing.T) {
+	body := "<edit_file>main.go\n<<<OLD\nfmt.Println(\"a\")\nOLD\n<<<NEW\nfmt.Println(\"b\")\nNEW\n</edit_file>"
+	tc := ParseToolCall(body)
+	if tc == nil {
+		t.Fatal("expected edit_file tool call")
+	}
+	if tc.Name != "edit_file" {
+		t.Fatalf("expected edit_file, got %q", tc.Name)
+	}
+	if got := tc.Arguments["path"]; got != "main.go" {
+		t.Fatalf("expected path main.go, got %#v", got)
+	}
+	if got := tc.Arguments["old"]; got != "fmt.Println(\"a\")" {
+		t.Fatalf("unexpected old: %#v", got)
+	}
+	if got := tc.Arguments["new"]; got != "fmt.Println(\"b\")" {
+		t.Fatalf("unexpected new: %#v", got)
+	}
+}
+
+func TestParseToolCall_EditFile_MalformedReportsParseError(t *testing.T) {
+	tc := ParseToolCall("<edit_file>main.go\n<<<OLD\nno close\n</edit_file>")
+	if tc == nil || tc.Name != "edit_file" {
+		t.Fatalf("expected edit_file call with parse_error, got %#v", tc)
+	}
+	if _, ok := tc.Arguments["parse_error"].(string); !ok {
+		t.Fatalf("expected parse_error argument, got %#v", tc.Arguments)
+	}
+}
+
+func TestSystemPrompt_MentionsEditFile(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<edit_file>") {
+		t.Fatalf("system prompt should advertise <edit_file>")
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {
