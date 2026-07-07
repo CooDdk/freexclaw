@@ -26,7 +26,114 @@ var (
 	listDirRegex    = regexp.MustCompile(`<list_dir>(.*?)</list_dir>`)
 	webSearchRegex  = regexp.MustCompile(`<web_search>\s*(.*?)\s*</web_search>`)
 	runCommandRegex = regexp.MustCompile(`<run_command>([\s\S]*?)</run_command>`)
+	editFileRegex   = regexp.MustCompile(`<edit_file>([\s\S]*?)</edit_file>`)
+	grepRegex       = regexp.MustCompile(`<grep>([\s\S]*?)</grep>`)
+	globRegex       = regexp.MustCompile(`<glob>([\s\S]*?)</glob>`)
 )
+
+// parseEditFileBody 解析 <edit_file> 内部：首行是路径，之后 <<<OLD ... OLD 段与
+// <<<NEW ... NEW 段各出现一次。任何格式偏差都返回 error。
+// parseGrepBody 解析 <grep> 内部：首行 pattern，其后 key: value 行。
+func parseGrepBody(body string) (map[string]interface{}, error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil, fmt.Errorf("grep body 为空")
+	}
+	lines := strings.Split(body, "\n")
+	args := map[string]interface{}{
+		"pattern": strings.TrimSpace(lines[0]),
+	}
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		kv := strings.SplitN(line, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		val := strings.TrimSpace(kv[1])
+		switch key {
+		case "path":
+			args["path"] = val
+		case "glob":
+			args["glob"] = val
+		case "case":
+			// case: i / insensitive / true / 1 都视为忽略大小写
+			args["ignore_case"] = val == "i" || val == "insensitive" || val == "true" || val == "1"
+		}
+	}
+	if args["pattern"] == "" {
+		return nil, fmt.Errorf("grep 缺少 pattern")
+	}
+	return args, nil
+}
+
+func parseEditFileBody(body string) (path, oldStr, newStr string, err error) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", "", "", fmt.Errorf("edit_file body 为空")
+	}
+
+	lines := strings.SplitN(body, "\n", 2)
+	path = strings.TrimSpace(lines[0])
+	if path == "" || len(lines) < 2 {
+		return "", "", "", fmt.Errorf("edit_file 缺少路径或替换块")
+	}
+	rest := lines[1]
+
+	oldStr, afterOld, ok := extractBlock(rest, "OLD")
+	if !ok {
+		return "", "", "", fmt.Errorf("edit_file 缺少 <<<OLD ... OLD 段")
+	}
+	newStr, _, ok = extractBlock(afterOld, "NEW")
+	if !ok {
+		return "", "", "", fmt.Errorf("edit_file 缺少 <<<NEW ... NEW 段")
+	}
+	return path, oldStr, newStr, nil
+}
+
+// extractBlock 找到 "<<<TAG" 起始行到只包含 "TAG" 的结束行之间的内容。
+func extractBlock(s, tag string) (content, remaining string, ok bool) {
+	openMarker := "<<<" + tag
+	closeMarker := tag
+	openIdx := strings.Index(s, openMarker)
+	if openIdx < 0 {
+		return "", "", false
+	}
+	// 定位 openMarker 所在行的下一行开始
+	afterOpen := s[openIdx+len(openMarker):]
+	if nl := strings.IndexByte(afterOpen, '\n'); nl >= 0 {
+		afterOpen = afterOpen[nl+1:]
+	} else {
+		return "", "", false
+	}
+	// 找到"独占一行"的 closeMarker
+	closeIdx := -1
+	scan := afterOpen
+	base := 0
+	for {
+		idx := strings.Index(scan, closeMarker)
+		if idx < 0 {
+			return "", "", false
+		}
+		absIdx := base + idx
+		// 判断是不是整行
+		startsLine := absIdx == 0 || afterOpen[absIdx-1] == '\n'
+		endPos := absIdx + len(closeMarker)
+		endsLine := endPos == len(afterOpen) || afterOpen[endPos] == '\n' || afterOpen[endPos] == '\r'
+		if startsLine && endsLine {
+			closeIdx = absIdx
+			break
+		}
+		scan = scan[idx+len(closeMarker):]
+		base = absIdx + len(closeMarker)
+	}
+	content = strings.TrimRight(afterOpen[:closeIdx], "\r\n")
+	remaining = afterOpen[closeIdx+len(closeMarker):]
+	return content, remaining, true
+}
 
 func SystemPrompt() string {
 	return `你是一个智能助手。当用户的问题需要实时信息（如天气、新闻、事件等），请使用 <web_search> 工具搜索网络获取最新信息。
@@ -49,6 +156,25 @@ func SystemPrompt() string {
 可选第一行写 cwd: 相对目录
 后续写要执行的单次命令
 </run_command>
+
+7. 精确编辑文件：<edit_file>相对路径
+<<<OLD
+待替换的原文（必须在文件中唯一命中）
+OLD
+<<<NEW
+替换后的内容
+NEW
+</edit_file>
+
+8. 内容检索（按正则）：<grep>正则
+path: 搜索目录（可选，默认当前）
+glob: *.go（可选，按文件名过滤）
+case: i（可选，i 表示忽略大小写）
+</grep>
+
+9. 按 glob 模式列文件：<glob>**/*.go
+path: 搜索目录（可选，默认当前）
+</glob>
 
 ## 严格规则
 
@@ -180,6 +306,67 @@ func ParseToolCall(content string) *ToolCall {
 		}
 	}
 
+	if matches := globRegex.FindStringSubmatch(content); len(matches) >= 2 {
+		body := strings.TrimSpace(matches[1])
+		if body == "" {
+			return &ToolCall{
+				Name:      "glob",
+				Arguments: map[string]interface{}{"parse_error": "glob body 为空"},
+			}
+		}
+		lines := strings.Split(body, "\n")
+		args := map[string]interface{}{
+			"pattern": strings.TrimSpace(lines[0]),
+		}
+		for _, line := range lines[1:] {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			kv := strings.SplitN(line, ":", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(kv[0]))
+			val := strings.TrimSpace(kv[1])
+			if key == "path" {
+				args["path"] = val
+			}
+		}
+		return &ToolCall{Name: "glob", Arguments: args}
+	}
+
+	if matches := grepRegex.FindStringSubmatch(content); len(matches) >= 2 {
+		args, err := parseGrepBody(matches[1])
+		if err != nil {
+			return &ToolCall{
+				Name:      "grep",
+				Arguments: map[string]interface{}{"parse_error": err.Error()},
+			}
+		}
+		return &ToolCall{Name: "grep", Arguments: args}
+	}
+
+	if matches := editFileRegex.FindStringSubmatch(content); len(matches) >= 2 {
+		path, oldStr, newStr, err := parseEditFileBody(matches[1])
+		if err != nil {
+			return &ToolCall{
+				Name: "edit_file",
+				Arguments: map[string]interface{}{
+					"parse_error": err.Error(),
+				},
+			}
+		}
+		return &ToolCall{
+			Name: "edit_file",
+			Arguments: map[string]interface{}{
+				"path": path,
+				"old":  oldStr,
+				"new":  newStr,
+			},
+		}
+	}
+
 	if matches := runCommandRegex.FindStringSubmatch(content); len(matches) >= 2 {
 		body := strings.TrimSpace(matches[1])
 		if body == "" {
@@ -229,6 +416,12 @@ func ExecuteToolWithProgress(tc *ToolCall, progress func(string)) ToolResult {
 		return executeWebSearch(tc.Arguments, progress)
 	case "run_command":
 		return executeRunCommand(tc.Arguments)
+	case "edit_file":
+		return executeEditFile(tc.Arguments)
+	case "grep":
+		return executeGrep(tc.Arguments)
+	case "glob":
+		return executeGlob(tc.Arguments)
 	default:
 		return ToolResult{
 			Success: false,
@@ -317,6 +510,76 @@ func executeRunCommand(args map[string]interface{}) ToolResult {
 	return ToolResult{
 		Success: true,
 		Output:  output,
+	}
+}
+
+func executeEditFile(args map[string]interface{}) ToolResult {
+	if msg, ok := args["parse_error"].(string); ok {
+		return ToolResult{Success: false, Error: msg}
+	}
+	path, ok := args["path"].(string)
+	if !ok || path == "" {
+		return ToolResult{Success: false, Error: "缺少 path 参数"}
+	}
+	oldStr, _ := args["old"].(string)
+	newStr, _ := args["new"].(string)
+
+	if err := tools.EditFile(path, oldStr, newStr); err != nil {
+		return ToolResult{Success: false, Error: err.Error()}
+	}
+	return ToolResult{
+		Success: true,
+		Output:  fmt.Sprintf("✓ 编辑成功: %s", path),
+	}
+}
+
+func executeGrep(args map[string]interface{}) ToolResult {
+	if msg, ok := args["parse_error"].(string); ok {
+		return ToolResult{Success: false, Error: msg}
+	}
+	pattern, ok := args["pattern"].(string)
+	if !ok || pattern == "" {
+		return ToolResult{Success: false, Error: "缺少 pattern 参数"}
+	}
+	opts := tools.GrepOptions{Pattern: pattern}
+	if v, ok := args["path"].(string); ok {
+		opts.Path = v
+	}
+	if v, ok := args["glob"].(string); ok {
+		opts.Glob = v
+	}
+	if v, ok := args["ignore_case"].(bool); ok {
+		opts.IgnoreCase = v
+	}
+	matches, err := tools.Grep(opts)
+	if err != nil {
+		return ToolResult{Success: false, Error: err.Error()}
+	}
+	return ToolResult{
+		Success: true,
+		Output:  tools.FormatGrepResults(matches, pattern, 200),
+	}
+}
+
+func executeGlob(args map[string]interface{}) ToolResult {
+	if msg, ok := args["parse_error"].(string); ok {
+		return ToolResult{Success: false, Error: msg}
+	}
+	pattern, ok := args["pattern"].(string)
+	if !ok || pattern == "" {
+		return ToolResult{Success: false, Error: "缺少 pattern 参数"}
+	}
+	opts := tools.GlobOptions{Pattern: pattern}
+	if v, ok := args["path"].(string); ok {
+		opts.Path = v
+	}
+	files, err := tools.Glob(opts)
+	if err != nil {
+		return ToolResult{Success: false, Error: err.Error()}
+	}
+	return ToolResult{
+		Success: true,
+		Output:  tools.FormatGlobResults(files, pattern, 200),
 	}
 }
 

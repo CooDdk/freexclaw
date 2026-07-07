@@ -49,6 +49,87 @@ func TestBuildToolResultMessage_UsesErrorWhenOutputEmpty(t *testing.T) {
 	}
 }
 
+func TestParseToolCall_EditFile(t *testing.T) {
+	body := "<edit_file>main.go\n<<<OLD\nfmt.Println(\"a\")\nOLD\n<<<NEW\nfmt.Println(\"b\")\nNEW\n</edit_file>"
+	tc := ParseToolCall(body)
+	if tc == nil {
+		t.Fatal("expected edit_file tool call")
+	}
+	if tc.Name != "edit_file" {
+		t.Fatalf("expected edit_file, got %q", tc.Name)
+	}
+	if got := tc.Arguments["path"]; got != "main.go" {
+		t.Fatalf("expected path main.go, got %#v", got)
+	}
+	if got := tc.Arguments["old"]; got != "fmt.Println(\"a\")" {
+		t.Fatalf("unexpected old: %#v", got)
+	}
+	if got := tc.Arguments["new"]; got != "fmt.Println(\"b\")" {
+		t.Fatalf("unexpected new: %#v", got)
+	}
+}
+
+func TestParseToolCall_EditFile_MalformedReportsParseError(t *testing.T) {
+	tc := ParseToolCall("<edit_file>main.go\n<<<OLD\nno close\n</edit_file>")
+	if tc == nil || tc.Name != "edit_file" {
+		t.Fatalf("expected edit_file call with parse_error, got %#v", tc)
+	}
+	if _, ok := tc.Arguments["parse_error"].(string); !ok {
+		t.Fatalf("expected parse_error argument, got %#v", tc.Arguments)
+	}
+}
+
+func TestSystemPrompt_MentionsEditFile(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<edit_file>") {
+		t.Fatalf("system prompt should advertise <edit_file>")
+	}
+}
+
+func TestParseToolCall_Grep(t *testing.T) {
+	body := "<grep>func Hello\npath: internal\nglob: *.go\ncase: i\n</grep>"
+	tc := ParseToolCall(body)
+	if tc == nil || tc.Name != "grep" {
+		t.Fatalf("expected grep tool call, got %#v", tc)
+	}
+	if got := tc.Arguments["pattern"]; got != "func Hello" {
+		t.Fatalf("pattern: %#v", got)
+	}
+	if got := tc.Arguments["path"]; got != "internal" {
+		t.Fatalf("path: %#v", got)
+	}
+	if got := tc.Arguments["glob"]; got != "*.go" {
+		t.Fatalf("glob: %#v", got)
+	}
+	if got := tc.Arguments["ignore_case"]; got != true {
+		t.Fatalf("ignore_case: %#v", got)
+	}
+}
+
+func TestSystemPrompt_MentionsGrep(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<grep>") {
+		t.Fatalf("system prompt should advertise <grep>")
+	}
+}
+
+func TestParseToolCall_Glob(t *testing.T) {
+	tc := ParseToolCall("<glob>**/*.go\npath: internal\n</glob>")
+	if tc == nil || tc.Name != "glob" {
+		t.Fatalf("expected glob tool call, got %#v", tc)
+	}
+	if got := tc.Arguments["pattern"]; got != "**/*.go" {
+		t.Fatalf("pattern: %#v", got)
+	}
+	if got := tc.Arguments["path"]; got != "internal" {
+		t.Fatalf("path: %#v", got)
+	}
+}
+
+func TestSystemPrompt_MentionsGlob(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<glob>") {
+		t.Fatalf("system prompt should advertise <glob>")
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {

@@ -8,6 +8,8 @@ import (
 
 // renderUserMessage renders user input as a single string suitable for tea.Println.
 // The first line is prefixed with "❯ "; continuation lines are indented by 2 spaces.
+// A leading blank line is prepended so each message is visually separated from
+// the previous one in scrollback.
 func renderUserMessage(text string) string {
 	text = strings.TrimRight(text, "\n")
 	if text == "" {
@@ -23,7 +25,7 @@ func renderUserMessage(text string) string {
 			out = append(out, "  "+l)
 		}
 	}
-	return strings.Join(out, "\n")
+	return "\n" + strings.Join(out, "\n")
 }
 
 // renderToolCall renders one completed tool call as a fixed-format block.
@@ -47,7 +49,7 @@ func renderToolCall(name string, args map[string]any, resultSummary string, ok b
 		tail = fmt.Sprintf("  %s %s\n%s", status, dur,
 			indentLines(strings.TrimRight(resultSummary, "\n"), "    "))
 	}
-	return head + "\n" + tail
+	return "\n" + head + "\n" + tail
 }
 
 func formatToolArgs(args map[string]any) string {
@@ -87,6 +89,8 @@ func indentLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 // width is used for markdown wrapping.
+// A leading blank line is prepended so each message is visually separated from
+// the previous one in scrollback.
 func renderAssistantMessage(content string, width int) string {
 	content = strings.TrimRight(content, "\n")
 	if content == "" {
@@ -104,5 +108,5 @@ func renderAssistantMessage(content string, width int) string {
 			out = append(out, "  "+l)
 		}
 	}
-	return strings.Join(out, "\n")
+	return "\n" + strings.Join(out, "\n")
 }

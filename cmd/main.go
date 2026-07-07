@@ -19,6 +19,7 @@ import (
 func main() {
 	splashEnabled := flag.Bool("splash", false, "启用启动动画（默认关闭）")
 	resumeID := flag.String("resume", "", "恢复指定 ID 的历史会话（默认新建空会话）")
+	yolo := flag.Bool("yolo", false, "跳过 run_command 的逐次确认提示（自动化脚本用）")
 	flag.Parse()
 
 	cwd, err := os.Getwd()
@@ -62,6 +63,7 @@ func main() {
 	model, err := tui.NewModel(cfg, tui.ModelOptions{
 		Splash:   *splashEnabled,
 		ResumeID: strings.TrimSpace(*resumeID),
+		Yolo:     *yolo,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 初始化界面失败: %v\n", err)
