@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -283,8 +284,16 @@ func (m *Manager) SetCurrent(id string) {
 	}
 }
 
+// List 返回所有会话，按 UpdatedAt 倒序（最近更新的排最前）。
+// 每次调用时排序，这样运行期间被活跃使用的会话能立刻冒泡到列表顶部，
+// 而不是只在下次启动重新加载时才归位。
 func (m *Manager) List() []*Conversation {
-	return m.conversations
+	out := make([]*Conversation, len(m.conversations))
+	copy(out, m.conversations)
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
 }
 
 func (m *Manager) Close() error {
