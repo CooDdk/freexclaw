@@ -79,7 +79,7 @@ func renderBanner(width int) string {
 	accentStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#F472B6")).
 		Bold(true)
-	verLine := "── freex claw · " + version + " ──"
+	verLine := "-- freex claw · " + version + " --"
 	lines = append(lines, accentStyle.Render(centerPad(verLine)))
 
 	lines = append(lines, "")
