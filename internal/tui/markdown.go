@@ -26,22 +26,17 @@ var (
 		Bold(true).
 		Foreground(lipgloss.Color("#FBBF24")).
 		BorderBottom(true).
-		BorderForeground(lipgloss.Color("#FBBF24")).
-		PaddingBottom(1).
-		MarginTop(1)
+		BorderForeground(lipgloss.Color("#FBBF24"))
 
 	h2Style = lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("#A78BFA")).
 		BorderBottom(true).
-		BorderForeground(lipgloss.Color("#6D28D9")).
-		PaddingBottom(1).
-		MarginTop(1)
+		BorderForeground(lipgloss.Color("#6D28D9"))
 
 	h3Style = lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("#34D399")).
-		MarginTop(1)
+		Foreground(lipgloss.Color("#34D399"))
 
 	h4Style = lipgloss.NewStyle().
 		Bold(true).
@@ -176,7 +171,28 @@ func renderMarkdown(content string, width int) string {
 		i++
 	}
 
-	return strings.Join(result, "\n")
+	return strings.Join(collapseBlankLines(result), "\n")
+}
+
+// collapseBlankLines returns lines with runs of consecutive empty lines
+// collapsed to a single empty line. Also strips a leading blank line so the
+// assistant message doesn't start with vertical whitespace.
+func collapseBlankLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	prevBlank := true // treat pre-start as blank so leading blanks are dropped
+	for _, l := range lines {
+		blank := strings.TrimSpace(stripStyle(l)) == ""
+		if blank && prevBlank {
+			continue
+		}
+		out = append(out, l)
+		prevBlank = blank
+	}
+	// Trim trailing blank as well.
+	for len(out) > 0 && strings.TrimSpace(stripStyle(out[len(out)-1])) == "" {
+		out = out[:len(out)-1]
+	}
+	return out
 }
 
 func renderHeading(text string, level int, width int) string {

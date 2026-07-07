@@ -27,6 +27,9 @@ type commandItem struct {
 	Desc string
 }
 
+// sessionHistoryReplayLimit 会话切换时最多重放到 scrollback 的可见消息条数
+const sessionHistoryReplayLimit = 20
+
 // commandList 可用的斜杠命令列表
 var commandList = []commandItem{
 	{"/help", "显示帮助"},
@@ -70,6 +73,9 @@ const ctrlCExitConfirmWindow = 2 * time.Second
 // ModelOptions carries runtime options for NewModel.
 type ModelOptions struct {
 	Splash bool
+	// ResumeID, if non-empty, tells NewModel to resume the given session ID
+	// instead of starting a fresh empty conversation.
+	ResumeID string
 }
 
 // pendingTool tracks a tool call currently being executed for spinner display.
@@ -151,13 +157,61 @@ func NewModel(cfg *config.Config, opts ModelOptions) (*Model, error) {
 		textarea:  ta,
 	}
 
+	// Session policy: default to a fresh empty conversation on each launch,
+	// even when the on-disk manager restored a `current_conversation_id` from
+	// the previous run. Historical sessions remain browsable via /sessions,
+	// /open, and the --resume CLI flag.
+	if opts.ResumeID != "" {
+		m.convMgr.SetCurrent(opts.ResumeID)
+		if cur := m.convMgr.GetCurrent(); cur == nil || cur.ID != opts.ResumeID {
+			return nil, fmt.Errorf("resume: 未找到会话 %s", opts.ResumeID)
+		}
+	} else {
+		m.convMgr.NewConversation()
+	}
+
 	m.textarea.Focus()
 
 	return m, nil
 }
 
 func (m *Model) Init() tea.Cmd {
-	return textarea.Blink
+	cmds := []tea.Cmd{textarea.Blink}
+	if cur := m.convMgr.GetCurrent(); cur != nil && len(cur.Messages) > 0 {
+		if replayCmds := m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit); len(replayCmds) > 0 {
+			header := tea.Println(SystemMessageStyle.Render(
+				fmt.Sprintf("恢复会话 %q 的历史消息：", cur.Title)))
+			cmds = append(cmds, tea.Sequence(append([]tea.Cmd{header}, replayCmds...)...))
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+// CurrentSessionID returns the ID of the active conversation, or "" if none.
+// Used by main to print the resume hint after graceful exit.
+func (m *Model) CurrentSessionID() string {
+	if cur := m.convMgr.GetCurrent(); cur != nil {
+		return cur.ID
+	}
+	return ""
+}
+
+// CurrentSessionHasMessages reports whether the active session recorded any
+// user/assistant messages during this run — used to decide whether the resume
+// hint is worth showing.
+func (m *Model) CurrentSessionHasMessages() bool {
+	cur := m.convMgr.GetCurrent()
+	if cur == nil {
+		return false
+	}
+	for _, msg := range cur.Messages {
+		if msg.Role == conversation.RoleUser || msg.Role == conversation.RoleAssistant {
+			if strings.TrimSpace(msg.Content) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -194,10 +248,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.convMgr.SetCurrent(msg.ID)
 		m.convMgr.Save()
 		title := "未命名"
+		var replayCmds []tea.Cmd
 		if cur := m.convMgr.GetCurrent(); cur != nil {
 			title = cur.Title
+			replayCmds = m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit)
 		}
-		return m, tea.Println(fmt.Sprintf("%s → 已切换到 %q", MarkerAssistant(), title))
+		switchLine := tea.Println(fmt.Sprintf("%s → 已切换到 %q", MarkerAssistant(), title))
+		if len(replayCmds) == 0 {
+			return m, switchLine
+		}
+		return m, tea.Sequence(append([]tea.Cmd{switchLine}, replayCmds...)...)
 
 	case sessionPickerCancelledMsg:
 		m.pickerActive = false
@@ -568,10 +628,151 @@ func tcToTag(tc *agent.ToolCall) string {
 	return ""
 }
 
+// parseToolCallTag decodes an assistant message that stores a preflight tool call
+// as `<toolname>arg</toolname>`. Returns ok=false for anything else.
+func parseToolCallTag(content string) (name string, arg string, ok bool) {
+	content = strings.TrimSpace(content)
+	if len(content) < 3 || content[0] != '<' {
+		return "", "", false
+	}
+	end := strings.IndexByte(content, '>')
+	if end < 2 {
+		return "", "", false
+	}
+	tag := content[1:end]
+	// Reject non-tag chars
+	for _, r := range tag {
+		if r == '/' || r == ' ' || r == '<' || r == '>' {
+			return "", "", false
+		}
+	}
+	closeTag := "</" + tag + ">"
+	if !strings.HasSuffix(content, closeTag) {
+		return "", "", false
+	}
+	return tag, content[end+1 : len(content)-len(closeTag)], true
+}
+
+// replaySessionHistoryCmds returns tea.Println commands that reprint the last
+// `limit` visible messages of sess into scrollback. System messages and hidden
+// tool-result messages are skipped. Prepends a "(省略 N 条更早的消息)" line
+// when older messages are truncated.
+func (m *Model) replaySessionHistoryCmds(sess *conversation.Conversation, limit int) []tea.Cmd {
+	if sess == nil || len(sess.Messages) == 0 {
+		return nil
+	}
+	kept := make([]conversation.Message, 0, len(sess.Messages))
+	for i, msg := range sess.Messages {
+		if msg.Role == conversation.RoleSystem {
+			continue
+		}
+		if msg.Role == conversation.RoleUser && shouldHideToolResultInContext(sess.Messages, i) {
+			continue
+		}
+		if strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	omitted := 0
+	if limit > 0 && len(kept) > limit {
+		omitted = len(kept) - limit
+		kept = kept[len(kept)-limit:]
+	}
+	var cmds []tea.Cmd
+	if omitted > 0 {
+		cmds = append(cmds, tea.Println(SystemMessageStyle.Render(
+			fmt.Sprintf("(省略 %d 条更早的消息)", omitted))))
+	}
+	for _, msg := range kept {
+		line := m.renderHistoryMessage(msg)
+		if line == "" {
+			continue
+		}
+		cmds = append(cmds, tea.Println(line))
+	}
+	return cmds
+}
+
+func (m *Model) renderHistoryMessage(msg conversation.Message) string {
+	switch msg.Role {
+	case conversation.RoleUser:
+		if strings.HasPrefix(msg.Content, "<|tool_result|>") {
+			return ""
+		}
+		return renderUserMessage(msg.Content)
+	case conversation.RoleAssistant:
+		if name, arg, ok := parseToolCallTag(msg.Content); ok {
+			return renderHistoryToolCall(name, arg)
+		}
+		return renderAssistantMessage(msg.Content, m.width)
+	}
+	return ""
+}
+
+func renderHistoryToolCall(name, arg string) string {
+	argStr := arg
+	if argStr != "" {
+		argStr = fmt.Sprintf("%q", arg)
+	}
+	return fmt.Sprintf("%s %s(%s)  %s",
+		MarkerToolStart(),
+		name,
+		argStr,
+		CommandHintDescStyle.Render("(历史)"),
+	)
+}
+
+// previewFileContent returns the first `maxLines` lines (or `maxBytes` bytes,
+// whichever comes first) of content. truncated is true when content was cut.
+// totalLines is the total line count of the original content.
+func previewFileContent(content string, maxLines, maxBytes int) (preview string, truncated bool, totalLines int) {
+	if content == "" {
+		return "", false, 0
+	}
+	totalLines = strings.Count(content, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		totalLines++
+	}
+	lines := strings.SplitAfter(content, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i >= maxLines {
+			truncated = true
+			break
+		}
+		if b.Len()+len(line) > maxBytes && b.Len() > 0 {
+			truncated = true
+			break
+		}
+		b.WriteString(line)
+	}
+	preview = strings.TrimRight(b.String(), "\n")
+	return preview, truncated, totalLines
+}
+
+func previewLineCount(preview string) int {
+	if preview == "" {
+		return 0
+	}
+	return strings.Count(preview, "\n") + 1
+}
+
 func canonicalizePreflightQuery(content string, match tools.MatchResult) string {
 	if match.Domain == "weather" {
 		location := strings.TrimSpace(match.Location)
 		timeOfDay := strings.TrimSpace(match.TimeOfDay)
+		if location != "" {
+			// 优先保留相对日期这个用户原话里的强信号（"明天/后天/今天"），比 N 天更贴意图
+			for _, day := range []string{"大后天", "后天", "明天", "今天"} {
+				if strings.Contains(content, day) {
+					return fmt.Sprintf("%s %s 天气预报", location, day)
+				}
+			}
+		}
 		if location != "" && match.ForecastDays > 1 {
 			return fmt.Sprintf("%s %d天 天气预报", location, match.ForecastDays)
 		}
@@ -748,6 +949,11 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		target := convs[idx-1]
 		m.convMgr.SetCurrent(target.ID)
 		emit(MarkerAssistant() + fmt.Sprintf(" → 已切换到 %q", target.Title))
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			for _, c := range m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit) {
+				cmds = append(cmds, c)
+			}
+		}
 
 	case "/rename":
 		if len(parts) < 2 {
@@ -776,6 +982,13 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 			emit(MarkerToolFail() + fmt.Sprintf(" 读取失败: %v", err))
 		} else {
 			current.AddMessage(conversation.RoleUser, fmt.Sprintf("请分析这个文件的内容:\n\n%s", tools.FormatFileContent(fc)))
+			preview, truncated, totalLines := previewFileContent(fc.Content, 60, 6000)
+			emit(fmt.Sprintf("%s %s (%d 行)", MarkerAssistant(), path, totalLines))
+			emit(preview)
+			if truncated {
+				emit(SystemMessageStyle.Render(
+					fmt.Sprintf("(仅显示前 %d 行预览，完整内容已加入下一轮上下文)", previewLineCount(preview))))
+			}
 			emit(MarkerToolOK() + " 已读取 " + path + "（内容已加入下一轮上下文）")
 		}
 
@@ -1355,6 +1568,9 @@ func (m *Model) renderInline() string {
 	var parts []string
 	parts = append(parts, m.textarea.View())
 
+	if hint := m.renderCommandHintInline(); hint != "" {
+		parts = append(parts, hint)
+	}
 	if m.isThinking {
 		parts = append(parts, m.renderSpinnerLine())
 	}
@@ -1363,6 +1579,54 @@ func (m *Model) renderInline() string {
 	}
 	parts = append(parts, m.renderStatusBarInline())
 	return strings.Join(parts, "\n")
+}
+
+// renderCommandHintInline draws the slash-command completion dropdown just below
+// the textarea when the user is typing a "/" command. Returns "" when hidden.
+func (m *Model) renderCommandHintInline() string {
+	if !m.commandHintVisible {
+		return ""
+	}
+	matched := m.matchedCommands()
+	if len(matched) == 0 {
+		return ""
+	}
+	const maxRows = 8
+	sel := m.commandHintIndex
+	if sel < 0 {
+		sel = 0
+	}
+	if sel >= len(matched) {
+		sel = len(matched) - 1
+	}
+	if len(matched) > maxRows {
+		start := 0
+		if sel >= maxRows {
+			start = sel - maxRows + 1
+		}
+		matched = matched[start : start+maxRows]
+		sel -= start
+	}
+	maxName := 0
+	for _, c := range matched {
+		if n := len(c.Name); n > maxName {
+			maxName = n
+		}
+	}
+	var lines []string
+	for i, c := range matched {
+		nameCol := c.Name + strings.Repeat(" ", maxName-len(c.Name))
+		var line string
+		if i == sel {
+			line = CommandHintSelectedItemStyle.Render(nameCol) + "  " + CommandHintDescStyle.Render(c.Desc)
+		} else {
+			line = CommandHintItemStyle.Render(nameCol) + "  " + CommandHintDescStyle.Render(c.Desc)
+		}
+		lines = append(lines, line)
+	}
+	footer := CommandHintDescStyle.Render("↑↓ 选择 · Tab/Enter 补全 · Esc 取消")
+	body := strings.Join(lines, "\n") + "\n" + footer
+	return CommandHintStyle.Render(body)
 }
 
 func (m *Model) renderSpinnerLine() string {

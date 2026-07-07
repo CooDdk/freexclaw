@@ -98,6 +98,34 @@ func TestRouteLiveQuery_WeatherTimeOfDayFollowUp(t *testing.T) {
 	}
 }
 
+func TestRouteLiveQuery_WeatherRelativeDayBumpsForecast(t *testing.T) {
+	cases := []struct {
+		name           string
+		query          string
+		wantLocation   string
+		wantMinForecast int
+	}{
+		{"明天", "武汉明天的天气", "武汉", 2},
+		{"后天", "武汉后天的天气", "武汉", 3},
+		{"大后天", "武汉大后天的天气", "武汉", 4},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			match := MatchLiveQuery(tc.query, LiveQueryContext{})
+			if match.Domain != "weather" {
+				t.Fatalf("expected weather domain, got %q", match.Domain)
+			}
+			if match.Location != tc.wantLocation {
+				t.Fatalf("expected location %q, got %q", tc.wantLocation, match.Location)
+			}
+			if match.ForecastDays < tc.wantMinForecast {
+				t.Fatalf("expected at least %d-day forecast, got %d", tc.wantMinForecast, match.ForecastDays)
+			}
+		})
+	}
+}
+
 func TestRouteLiveQuery_WeatherCurrentFollowUpUsesContext(t *testing.T) {
 	ctx := LiveQueryContext{
 		Domain:   "weather",

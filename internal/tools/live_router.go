@@ -108,7 +108,7 @@ func normalizeWeatherLocationCandidate(location string) string {
 		return ""
 	}
 
-	invalidParts := []string{"未来", "7天", "七天", "今天", "明天", "后天", "这周", "最新", "当前", "目前", "此刻", "现在", "上午", "下午", "中午", "晚上", "凌晨", "傍晚", "早上", "夜间", "呢"}
+	invalidParts := []string{"未来", "7天", "七天", "今天", "明天", "大后天", "后天", "这周", "最新", "当前", "目前", "此刻", "现在", "上午", "下午", "中午", "晚上", "凌晨", "傍晚", "早上", "夜间", "呢"}
 	for _, part := range invalidParts {
 		if strings.Contains(location, part) {
 			return ""
@@ -137,6 +137,16 @@ func extractForecastDays(query string, ctx LiveQueryContext) int {
 	}
 	if strings.Contains(query, "7天") || strings.Contains(query, "七天") {
 		return 7
+	}
+	// 相对日期需要拉多日预报数据才能覆盖到目标日期
+	if strings.Contains(query, "大后天") {
+		return 4
+	}
+	if strings.Contains(query, "后天") {
+		return 3
+	}
+	if strings.Contains(query, "明天") {
+		return 2
 	}
 	if strings.Contains(query, "未来") && ctx.ForecastDays > 0 {
 		return ctx.ForecastDays

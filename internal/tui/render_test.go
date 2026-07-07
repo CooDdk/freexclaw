@@ -145,3 +145,24 @@ func TestRenderStatusBarInline_ContainsBrand(t *testing.T) {
 		t.Fatalf("missing model name: %q", bar)
 	}
 }
+
+func TestRenderMarkdown_CollapsesConsecutiveBlankLines(t *testing.T) {
+	// Heading margins + block trailing "" + source-level blank line used to
+	// stack up to 3 blank lines between sections. Verify the result never
+	// contains more than one blank line in a row.
+	src := "## 标题一\n\n- 条目 A\n- 条目 B\n\n## 标题二\n\n段落文本"
+	rendered := renderMarkdown(src, 80)
+	if strings.Contains(rendered, "\n\n\n") {
+		t.Fatalf("expected no runs of 3+ newlines, got:\n%q", rendered)
+	}
+}
+
+func TestRenderMarkdown_NoLeadingOrTrailingBlank(t *testing.T) {
+	rendered := renderMarkdown("## 标题\n\n段落", 80)
+	if strings.HasPrefix(rendered, "\n") {
+		t.Fatalf("expected no leading blank, got: %q", rendered)
+	}
+	if strings.HasSuffix(rendered, "\n") {
+		t.Fatalf("expected no trailing blank, got: %q", rendered)
+	}
+}
