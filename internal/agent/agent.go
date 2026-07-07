@@ -28,6 +28,7 @@ var (
 	runCommandRegex = regexp.MustCompile(`<run_command>([\s\S]*?)</run_command>`)
 	editFileRegex   = regexp.MustCompile(`<edit_file>([\s\S]*?)</edit_file>`)
 	grepRegex       = regexp.MustCompile(`<grep>([\s\S]*?)</grep>`)
+	globRegex       = regexp.MustCompile(`<glob>([\s\S]*?)</glob>`)
 )
 
 // parseEditFileBody 解析 <edit_file> 内部：首行是路径，之后 <<<OLD ... OLD 段与
@@ -171,6 +172,10 @@ glob: *.go（可选，按文件名过滤）
 case: i（可选，i 表示忽略大小写）
 </grep>
 
+9. 按 glob 模式列文件：<glob>**/*.go
+path: 搜索目录（可选，默认当前）
+</glob>
+
 ## 严格规则
 
 **当用户要求搜索、查询实时信息时，你必须使用 <web_search> 工具！**
@@ -301,6 +306,36 @@ func ParseToolCall(content string) *ToolCall {
 		}
 	}
 
+	if matches := globRegex.FindStringSubmatch(content); len(matches) >= 2 {
+		body := strings.TrimSpace(matches[1])
+		if body == "" {
+			return &ToolCall{
+				Name:      "glob",
+				Arguments: map[string]interface{}{"parse_error": "glob body 为空"},
+			}
+		}
+		lines := strings.Split(body, "\n")
+		args := map[string]interface{}{
+			"pattern": strings.TrimSpace(lines[0]),
+		}
+		for _, line := range lines[1:] {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			kv := strings.SplitN(line, ":", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(kv[0]))
+			val := strings.TrimSpace(kv[1])
+			if key == "path" {
+				args["path"] = val
+			}
+		}
+		return &ToolCall{Name: "glob", Arguments: args}
+	}
+
 	if matches := grepRegex.FindStringSubmatch(content); len(matches) >= 2 {
 		args, err := parseGrepBody(matches[1])
 		if err != nil {
@@ -385,6 +420,8 @@ func ExecuteToolWithProgress(tc *ToolCall, progress func(string)) ToolResult {
 		return executeEditFile(tc.Arguments)
 	case "grep":
 		return executeGrep(tc.Arguments)
+	case "glob":
+		return executeGlob(tc.Arguments)
 	default:
 		return ToolResult{
 			Success: false,
@@ -521,6 +558,28 @@ func executeGrep(args map[string]interface{}) ToolResult {
 	return ToolResult{
 		Success: true,
 		Output:  tools.FormatGrepResults(matches, pattern, 200),
+	}
+}
+
+func executeGlob(args map[string]interface{}) ToolResult {
+	if msg, ok := args["parse_error"].(string); ok {
+		return ToolResult{Success: false, Error: msg}
+	}
+	pattern, ok := args["pattern"].(string)
+	if !ok || pattern == "" {
+		return ToolResult{Success: false, Error: "缺少 pattern 参数"}
+	}
+	opts := tools.GlobOptions{Pattern: pattern}
+	if v, ok := args["path"].(string); ok {
+		opts.Path = v
+	}
+	files, err := tools.Glob(opts)
+	if err != nil {
+		return ToolResult{Success: false, Error: err.Error()}
+	}
+	return ToolResult{
+		Success: true,
+		Output:  tools.FormatGlobResults(files, pattern, 200),
 	}
 }
 

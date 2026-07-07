@@ -111,6 +111,25 @@ func TestSystemPrompt_MentionsGrep(t *testing.T) {
 	}
 }
 
+func TestParseToolCall_Glob(t *testing.T) {
+	tc := ParseToolCall("<glob>**/*.go\npath: internal\n</glob>")
+	if tc == nil || tc.Name != "glob" {
+		t.Fatalf("expected glob tool call, got %#v", tc)
+	}
+	if got := tc.Arguments["pattern"]; got != "**/*.go" {
+		t.Fatalf("pattern: %#v", got)
+	}
+	if got := tc.Arguments["path"]; got != "internal" {
+		t.Fatalf("path: %#v", got)
+	}
+}
+
+func TestSystemPrompt_MentionsGlob(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<glob>") {
+		t.Fatalf("system prompt should advertise <glob>")
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {
