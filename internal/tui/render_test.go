@@ -20,6 +20,8 @@ func TestRenderUserMessage_ContainsMarkerAndText(t *testing.T) {
 
 func TestRenderUserMessage_MultilineIndent(t *testing.T) {
 	got := renderUserMessage("line1\nline2\nline3")
+	// A leading blank line is prepended for visual separation between messages.
+	got = strings.TrimPrefix(got, "\n")
 	lines := strings.Split(got, "\n")
 	if len(lines) != 3 {
 		t.Fatalf("expected 3 lines, got %d: %q", len(lines), got)
@@ -29,6 +31,13 @@ func TestRenderUserMessage_MultilineIndent(t *testing.T) {
 	}
 	if strings.Contains(lines[1], "❯") {
 		t.Fatalf("continuation line should not have marker: %q", lines[1])
+	}
+}
+
+func TestRenderUserMessage_HasLeadingBlankLineForSpacing(t *testing.T) {
+	got := renderUserMessage("hi")
+	if !strings.HasPrefix(got, "\n") {
+		t.Fatalf("expected leading blank line for message spacing, got %q", got)
 	}
 }
 

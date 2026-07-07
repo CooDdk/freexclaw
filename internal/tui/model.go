@@ -1610,17 +1610,23 @@ func (m *Model) renderInline() string {
 	}
 
 	var parts []string
-	parts = append(parts, m.renderInputDividerInline())
-	parts = append(parts, m.textarea.View())
 
-	if hint := m.renderCommandHintInline(); hint != "" {
-		parts = append(parts, hint)
-	}
+	// 状态指示放在输入框上方（消息内容区域末尾），这样用户能明显看到
+	// 自己刚发出的指令正在被处理，而不是把 spinner 藏在输入框下面。
 	if m.isThinking {
 		parts = append(parts, m.renderSpinnerLine())
 	}
 	if m.activeToolCall != nil {
 		parts = append(parts, m.renderToolCallLine())
+	}
+
+	// 输入区上方留一行空白，让消息内容区域和输入框有清晰的视觉距离。
+	parts = append(parts, "")
+	parts = append(parts, m.renderInputDividerInline())
+	parts = append(parts, m.textarea.View())
+
+	if hint := m.renderCommandHintInline(); hint != "" {
+		parts = append(parts, hint)
 	}
 	parts = append(parts, m.renderStatusBarInline())
 	return strings.Join(parts, "\n")
