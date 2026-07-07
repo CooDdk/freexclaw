@@ -152,14 +152,36 @@ func (m *Manager) load() {
 	}
 	defer rows.Close()
 
+	var legacyEmptyIDs []string
 	for rows.Next() {
 		var c Conversation
 		if err := rows.Scan(&c.ID, &c.Title, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			continue
 		}
 		c.Messages = m.loadMessages(c.ID)
+		// 老版本会在进入 TUI 时就占坑写一条"新对话"空会话，反复进出会累积一堆。
+		// 启动加载时顺手把这些遗留脏数据清掉。
+		if !isPersistable(&c) {
+			legacyEmptyIDs = append(legacyEmptyIDs, c.ID)
+			continue
+		}
 		m.conversations = append(m.conversations, &c)
 	}
+	rows.Close()
+
+	for _, id := range legacyEmptyIDs {
+		_, _ = m.db.Exec("DELETE FROM conversations WHERE id = ?", id)
+	}
+}
+
+// isPersistable 判断一个会话是否值得写入 DB：
+// 至少要有一条消息，或者用户已经把默认标题改过了。
+// 只是进 TUI 又退出、什么都没做的空会话不该占坑。
+func isPersistable(c *Conversation) bool {
+	if len(c.Messages) > 0 {
+		return true
+	}
+	return c.Title != "" && c.Title != "新对话"
 }
 
 func (m *Manager) loadMessages(convID string) []Message {
@@ -196,8 +218,16 @@ func (m *Manager) Save() error {
 	}
 	defer tx.Rollback()
 
-	// 保存当前会话ID
-	if m.currentID != "" {
+	// 只有当前会话本身值得持久化时，才把它记为 current，
+	// 否则下次启动读回来的 currentID 会指向一条根本没写盘的会话。
+	currentPersistable := false
+	for _, c := range m.conversations {
+		if c.ID == m.currentID && isPersistable(c) {
+			currentPersistable = true
+			break
+		}
+	}
+	if currentPersistable {
 		_, _ = tx.Exec(
 			"INSERT OR REPLACE INTO settings (key, value) VALUES ('current_conversation_id', ?)",
 			m.currentID,
@@ -206,6 +236,11 @@ func (m *Manager) Save() error {
 
 	// 保存所有会话
 	for _, c := range m.conversations {
+		if !isPersistable(c) {
+			// 空会话不落盘。顺手把之前版本可能写过的行清掉，避免遗留。
+			_, _ = tx.Exec("DELETE FROM conversations WHERE id = ?", c.ID)
+			continue
+		}
 		_, err := tx.Exec(
 			"INSERT OR REPLACE INTO conversations (id, title, work_dir_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
 			c.ID, c.Title, hashWorkDir(m.workDir), c.CreatedAt, c.UpdatedAt,
@@ -242,18 +277,8 @@ func (m *Manager) NewConversation() *Conversation {
 	m.conversations = append([]*Conversation{c}, m.conversations...)
 	m.currentID = c.ID
 
-	// 同步到数据库
-	if m.db != nil {
-		_, _ = m.db.Exec(
-			"INSERT INTO conversations (id, title, work_dir_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-			c.ID, c.Title, hashWorkDir(m.workDir), c.CreatedAt, c.UpdatedAt,
-		)
-		_, _ = m.db.Exec(
-			"INSERT OR REPLACE INTO settings (key, value) VALUES ('current_conversation_id', ?)",
-			c.ID,
-		)
-	}
-
+	// 空会话先不落盘，等真的有内容（消息或改过标题）后再由 Save() 写入。
+	// 避免用户反复进 TUI 又退出，累积一堆"新对话 (0 条)"。
 	return c
 }
 
