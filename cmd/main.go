@@ -1,10 +1,15 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 
 	"github.com/CooDdk/freexclaw/internal/config"
 	"github.com/CooDdk/freexclaw/internal/tools"
@@ -12,6 +17,10 @@ import (
 )
 
 func main() {
+	splashEnabled := flag.Bool("splash", false, "启用启动动画（默认关闭）")
+	resumeID := flag.String("resume", "", "恢复指定 ID 的历史会话（默认新建空会话）")
+	flag.Parse()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 获取当前目录失败: %v\n", err)
@@ -42,15 +51,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	model, err := tui.NewModel(cfg)
+	// Print brand banner once (into scrollback)
+	width := 80
+	if w, _, terr := term.GetSize(int(os.Stdout.Fd())); terr == nil && w > 0 {
+		width = w
+	}
+	fmt.Println(tui.RenderBannerPublic(width))
+	fmt.Println()
+
+	model, err := tui.NewModel(cfg, tui.ModelOptions{
+		Splash:   *splashEnabled,
+		ResumeID: strings.TrimSpace(*resumeID),
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 初始化界面失败: %v\n", err)
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// Inline rendering: no alt-screen, no mouse capture.
+	p := tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "[FreeX Claw] 运行失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// On graceful exit, hint the user how to resume this exact session.
+	if id := model.CurrentSessionID(); id != "" && model.CurrentSessionHasMessages() {
+		fmt.Println()
+		fmt.Println("Resume this session with:")
+		fmt.Printf("  %s --resume %s\n", resumeCommandName(), id)
+	}
+}
+
+// resumeCommandName returns the invocation string used in the resume hint.
+// Strategy: if the binary is resolvable on PATH (matches the running executable
+// after symlink resolution), return its basename so the hint is short and works
+// in the user's shell. Otherwise fall back to the absolute path so the hint is
+// verbose but always runnable.
+func resumeCommandName() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		exe = os.Args[0]
+	}
+	if exe == "" {
+		return "freexclaw"
+	}
+	base := filepath.Base(exe)
+	if resolved, lerr := exec.LookPath(base); lerr == nil {
+		a, e1 := filepath.EvalSymlinks(resolved)
+		b, e2 := filepath.EvalSymlinks(exe)
+		if e1 == nil && e2 == nil && strings.EqualFold(a, b) {
+			return base
+		}
+	}
+	return exe
 }

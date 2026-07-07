@@ -43,6 +43,7 @@ var weatherNoiseReplacer = strings.NewReplacer(
 	"实况", " ",
 	"今天", " ",
 	"明天", " ",
+	"大后天", " ",
 	"后天", " ",
 	"未来7天", " ",
 	"未来七天", " ",

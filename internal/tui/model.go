@@ -10,11 +10,10 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cloudwego/eino/schema"
-	"github.com/atotto/clipboard"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/CooDdk/freexclaw/internal/agent"
 	"github.com/CooDdk/freexclaw/internal/config"
@@ -23,20 +22,14 @@ import (
 	"github.com/CooDdk/freexclaw/internal/tools"
 )
 
-type focusState int
-
-const (
-	focusInput focusState = iota
-	focusChat
-)
-
-var copyToClipboard = clipboard.WriteAll
-
 // commandItem 定义一个斜杠命令
 type commandItem struct {
 	Name string
 	Desc string
 }
+
+// sessionHistoryReplayLimit 会话切换时最多重放到 scrollback 的可见消息条数
+const sessionHistoryReplayLimit = 20
 
 // commandList 可用的斜杠命令列表
 var commandList = []commandItem{
@@ -76,25 +69,28 @@ func tickCmd() tea.Cmd {
 	})
 }
 
-type splashTickMsg time.Time
+const ctrlCExitConfirmWindow = 2 * time.Second
 
-func splashTickCmd() tea.Cmd {
-	return tea.Tick(60*time.Millisecond, func(t time.Time) tea.Msg {
-		return splashTickMsg(t)
-	})
+// ModelOptions carries runtime options for NewModel.
+type ModelOptions struct {
+	Splash bool
+	// ResumeID, if non-empty, tells NewModel to resume the given session ID
+	// instead of starting a fresh empty conversation.
+	ResumeID string
 }
 
-type splashEndMsg struct{}
-
-const ctrlCExitConfirmWindow = 2 * time.Second
+// pendingTool tracks a tool call currently being executed for spinner display.
+type pendingTool struct {
+	Name      string
+	Arguments map[string]any
+	StartedAt time.Time
+}
 
 type Model struct {
 	cfg          *config.Config
 	llmClient    *llm.Client
 	convMgr      *conversation.Manager
-	viewport     viewport.Model
 	textarea     textarea.Model
-	focus        focusState
 	width        int
 	height       int
 	isStreaming  bool
@@ -102,9 +98,7 @@ type Model struct {
 	streamCancel context.CancelFunc
 	chunkCh      <-chan llm.StreamChunk
 	toolCh       <-chan tea.Msg
-	showHelp     bool
 	err          error
-	dotsAnim     int
 	isToolRunning bool
 	toolStatusText string
 	// 命令提示面板
@@ -114,12 +108,6 @@ type Model struct {
 	inputHistory     []string
 	inputHistoryIdx  int
 	inputHistoryTemp string
-	// 强制滚动到底部标志
-	forceScrollBottom bool
-	// 启动页
-	showSplash     bool
-	splashStage    int
-	splashProgress float64
 	runtimePromptProfile string
 	runtimePromptSummary string
 	turnPrompt         string
@@ -130,10 +118,18 @@ type Model struct {
 	turnAutoPlanned    bool
 	turnAutoToolQueue  []*agent.ToolCall
 	ctrlCPrimedAt      time.Time
-	flashMessage       string
+	// P2 inline migration new fields (Task 7)
+	isThinking     bool
+	thinkingLabel  string
+	tokenCount     int
+	streamBuf      strings.Builder
+	spinnerTickN   int
+	activeToolCall *pendingTool
+	pickerActive   bool
+	picker         *sessionPicker
 }
 
-func NewModel(cfg *config.Config) (*Model, error) {
+func NewModel(cfg *config.Config, opts ModelOptions) (*Model, error) {
 	llmClient, err := llm.NewClient(&llm.ClientConfig{
 		APIKey:  cfg.APIKey,
 		BaseURL: cfg.BaseURL,
@@ -155,29 +151,68 @@ func NewModel(cfg *config.Config) (*Model, error) {
 	ta.KeyMap.LinePrevious = key.NewBinding(key.WithKeys(""))
 	ta.KeyMap.LineNext = key.NewBinding(key.WithKeys(""))
 
-	vp := viewport.New(0, 0)
-	vp.MouseWheelEnabled = true
-
 	m := &Model{
-		cfg:         cfg,
-		llmClient:   llmClient,
-		convMgr:     conversation.NewManager(tools.GetWorkDir()),
-		viewport:    vp,
-		textarea:    ta,
-		focus:       focusInput,
-		showHelp:    true,
-		showSplash:  true,
-		splashStage: 0,
+		cfg:       cfg,
+		llmClient: llmClient,
+		convMgr:   conversation.NewManager(tools.GetWorkDir()),
+		textarea:  ta,
+	}
+
+	// Session policy: default to a fresh empty conversation on each launch,
+	// even when the on-disk manager restored a `current_conversation_id` from
+	// the previous run. Historical sessions remain browsable via /sessions,
+	// /open, and the --resume CLI flag.
+	if opts.ResumeID != "" {
+		m.convMgr.SetCurrent(opts.ResumeID)
+		if cur := m.convMgr.GetCurrent(); cur == nil || cur.ID != opts.ResumeID {
+			return nil, fmt.Errorf("resume: 未找到会话 %s", opts.ResumeID)
+		}
+	} else {
+		m.convMgr.NewConversation()
 	}
 
 	m.textarea.Focus()
-	m.updateChatView()
 
 	return m, nil
 }
 
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, splashTickCmd())
+	cmds := []tea.Cmd{textarea.Blink}
+	if cur := m.convMgr.GetCurrent(); cur != nil && len(cur.Messages) > 0 {
+		if replayCmds := m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit); len(replayCmds) > 0 {
+			header := tea.Println(SystemMessageStyle.Render(
+				fmt.Sprintf("恢复会话 %q 的历史消息：", cur.Title)))
+			cmds = append(cmds, tea.Sequence(append([]tea.Cmd{header}, replayCmds...)...))
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+// CurrentSessionID returns the ID of the active conversation, or "" if none.
+// Used by main to print the resume hint after graceful exit.
+func (m *Model) CurrentSessionID() string {
+	if cur := m.convMgr.GetCurrent(); cur != nil {
+		return cur.ID
+	}
+	return ""
+}
+
+// CurrentSessionHasMessages reports whether the active session recorded any
+// user/assistant messages during this run — used to decide whether the resume
+// hint is worth showing.
+func (m *Model) CurrentSessionHasMessages() bool {
+	cur := m.convMgr.GetCurrent()
+	if cur == nil {
+		return false
+	}
+	for _, msg := range cur.Messages {
+		if msg.Role == conversation.RoleUser || msg.Role == conversation.RoleAssistant {
+			if strings.TrimSpace(msg.Content) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -188,36 +223,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.resize()
-		return m, nil
-
-	case splashTickMsg:
-		if m.showSplash {
-			m.splashStage++
-			m.splashProgress = float64(m.splashStage) / 40.0
-			if m.splashProgress > 1.0 {
-				m.splashProgress = 1.0
-			}
-			if m.splashStage >= 50 {
-				m.showSplash = false
-				m.forceScrollBottom = true
-				m.updateChatView()
-				return m, nil
-			}
-			return m, splashTickCmd()
-		}
-		return m, nil
-
-	case splashEndMsg:
-		m.showSplash = false
-		m.forceScrollBottom = true
-		m.updateChatView()
+		m.textarea.SetWidth(msg.Width)
 		return m, nil
 
 	case tickMsg:
-		if m.isStreaming {
-			m.dotsAnim++
-			m.updateChatView()
+		if m.isThinking || m.activeToolCall != nil {
+			m.spinnerTickN++
 			return m, tickCmd()
 		}
 		return m, nil
@@ -227,94 +238,61 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolProgressMsg:
 		m.toolStatusText = msg.text
-		m.forceScrollBottom = true
-		m.updateChatView()
 		return m, m.waitForToolEvent()
 
 	case toolExecutedMsg:
 		return m.handleToolExecuted(msg)
 
+	case sessionPickerSelectedMsg:
+		m.pickerActive = false
+		m.picker = nil
+		m.convMgr.SetCurrent(msg.ID)
+		m.convMgr.Save()
+		title := "未命名"
+		var replayCmds []tea.Cmd
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			title = cur.Title
+			replayCmds = m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit)
+		}
+		switchLine := tea.Println(fmt.Sprintf("%s → 已切换到 %q", MarkerAssistant(), title))
+		if len(replayCmds) == 0 {
+			return m, switchLine
+		}
+		return m, tea.Sequence(append([]tea.Cmd{switchLine}, replayCmds...)...)
+
+	case sessionPickerCancelledMsg:
+		m.pickerActive = false
+		m.picker = nil
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKeyMsg(msg)
-
-	case tea.MouseMsg:
-		return m.handleMouseMsg(msg)
 	}
 
-	if m.focus == focusInput {
-		m.textarea, cmd = m.textarea.Update(msg)
-		cmds = append(cmds, cmd)
-		// textarea 内容可能变化，更新命令提示面板
-		if m.updateCommandHint() {
-			m.resize()
-		}
-	}
-	m.viewport, cmd = m.viewport.Update(msg)
+	m.textarea, cmd = m.textarea.Update(msg)
 	cmds = append(cmds, cmd)
+	// textarea 内容可能变化，更新命令提示面板
+	m.updateCommandHint()
 
 	return m, tea.Batch(cmds...)
 }
 
-func (m *Model) handleMouseMsg(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if m.showSplash {
-		m.showSplash = false
-		m.forceScrollBottom = true
-		m.updateChatView()
-		return m, nil
-	}
-
-	m.clearCtrlCExitState()
-
-	switch {
-	case msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft:
-		if m.isChatAreaY(msg.Y) {
-			m.setFocusChat()
-			return m, nil
-		}
-		if m.isInputZoneY(msg.Y) {
-			m.setFocusInput()
-			return m, nil
-		}
-	case msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown:
-		if m.isInputZoneY(msg.Y) && !m.isStreaming && !m.commandHintVisible {
-			m.setFocusInput()
-			if msg.Button == tea.MouseButtonWheelUp {
-				m.navigateHistory(-1)
-			} else {
-				m.navigateHistory(1)
-			}
-			return m, nil
-		}
-		if m.isChatAreaY(msg.Y) {
-			m.setFocusChat()
-			var cmd tea.Cmd
-			m.viewport, cmd = m.viewport.Update(msg)
-			return m, cmd
-		}
-	}
-
-	return m, nil
-}
-
 func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.showSplash {
-		m.showSplash = false
-		m.forceScrollBottom = true
-		m.updateChatView()
-		return m, nil
+	if m.pickerActive && m.picker != nil {
+		var cmd tea.Cmd
+		m.picker, cmd = m.picker.Update(msg)
+		return m, cmd
 	}
 
 	if msg.String() != "ctrl+c" {
 		m.clearCtrlCExitState()
 	}
-	m.flashMessage = ""
 
 	switch msg.String() {
 	case "ctrl+c":
 		if m.isStreaming {
 			m.stopStreaming()
 			m.clearCtrlCExitState()
-			m.updateChatView()
 			return m, nil
 		}
 		if m.shouldQuitOnCtrlC() {
@@ -326,23 +304,16 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		m.clearCtrlCExitState()
-		// 命令提示面板开启时，esc 优先关闭提示
+		// 命令提示面板开启时，esc 关闭提示
 		if m.commandHintVisible {
 			m.commandHintVisible = false
 			m.commandHintIndex = 0
-			m.resize()
-			return m, nil
 		}
-		m.toggleFocus()
 		return m, nil
 	}
 
-	if m.focus == focusChat {
-		return m.handleChatKey(msg)
-	}
-
-	// 输入框焦点下，命令提示面板关闭时，上下键切换输入历史
-	if m.focus == focusInput && !m.isStreaming && !m.commandHintVisible {
+	// 命令提示面板关闭时，上下键切换输入历史
+	if !m.isStreaming && !m.commandHintVisible {
 		if msg.String() == "up" {
 			m.navigateHistory(-1)
 			return m, nil
@@ -395,7 +366,6 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.textarea.SetValue(matched[m.commandHintIndex].Name + " ")
 				m.commandHintVisible = false
-				m.resize()
 			}
 			return m, nil
 		}
@@ -404,23 +374,11 @@ func (m *Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if !m.isStreaming {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
-		if m.updateCommandHint() {
-			m.resize()
-		}
+		m.updateCommandHint()
 		return m, cmd
 	}
 
 	return m, nil
-}
-
-func (m *Model) setFocusInput() {
-	m.focus = focusInput
-	m.textarea.Focus()
-}
-
-func (m *Model) setFocusChat() {
-	m.focus = focusChat
-	m.textarea.Blur()
 }
 
 func (m *Model) shouldQuitOnCtrlC() bool {
@@ -429,13 +387,11 @@ func (m *Model) shouldQuitOnCtrlC() bool {
 
 func (m *Model) prepareCtrlCToClearInput() {
 	m.ctrlCPrimedAt = time.Now()
-	m.focus = focusInput
 	m.textarea.Focus()
 	m.textarea.SetValue("")
 	m.commandHintVisible = false
 	m.commandHintIndex = 0
 	m.inputHistoryTemp = ""
-	m.resize()
 }
 
 func (m *Model) clearCtrlCExitState() {
@@ -449,66 +405,12 @@ func (m *Model) clearCtrlCExitState() {
 	m.ctrlCPrimedAt = time.Time{}
 }
 
-func (m *Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "j", "down":
-		m.viewport.LineDown(1)
-		return m, nil
-	case "k", "up":
-		m.viewport.LineUp(1)
-		return m, nil
-	case "ctrl+d":
-		m.viewport.HalfPageDown()
-		return m, nil
-	case "ctrl+u":
-		m.viewport.HalfPageUp()
-		return m, nil
-	case "g":
-		m.viewport.GotoTop()
-		return m, nil
-	case "G":
-		m.viewport.GotoBottom()
-		return m, nil
-	case "y":
-		m.copyLastAssistantMessage()
-		return m, nil
-	default:
-		m.focus = focusInput
-		m.textarea.Focus()
-		return m, nil
-	}
-}
-
-func (m *Model) copyLastAssistantMessage() {
-	current := m.convMgr.GetCurrent()
-	if current == nil {
-		m.flashMessage = "没有可复制的消息"
-		return
-	}
-	for i := len(current.Messages) - 1; i >= 0; i-- {
-		msg := current.Messages[i]
-		if msg.Role != conversation.RoleAssistant {
-			continue
-		}
-		content := strings.TrimSpace(msg.Content)
-		if content == "" {
-			continue
-		}
-		if err := copyToClipboard(content); err != nil {
-			m.flashMessage = fmt.Sprintf("复制失败: %v", err)
-			return
-		}
-		m.flashMessage = fmt.Sprintf("已复制 %d 字符", len([]rune(content)))
-		return
-	}
-	m.flashMessage = "没有可复制的消息"
-}
-
 func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 	current := m.convMgr.GetCurrent()
 
 	if msg.err != nil {
 		m.err = msg.err
+		m.isThinking = false
 		m.isStreaming = false
 		// 流式失败时，删除之前添加的空 assistant 消息，避免下次请求发送空消息给 API
 		if len(current.Messages) > 0 {
@@ -517,13 +419,23 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 				current.Messages = current.Messages[:len(current.Messages)-1]
 			}
 		}
-		m.updateChatView()
+		m.streamBuf.Reset()
 		m.convMgr.Save()
-		return m, nil
+		return m, tea.Println(MarkerWarn() + " 出错: " + msg.err.Error())
 	}
 
 	if msg.done {
+		m.isThinking = false
 		m.isStreaming = false
+		// 最终内容写回会话，供持久化使用
+		content := m.streamBuf.String()
+		m.streamBuf.Reset()
+		if len(current.Messages) > 0 {
+			last := &current.Messages[len(current.Messages)-1]
+			if last.Role == conversation.RoleAssistant {
+				last.Content = content
+			}
+		}
 		// 如果最终内容为空（模型返回空），删除这条空消息
 		if len(current.Messages) > 0 {
 			last := &current.Messages[len(current.Messages)-1]
@@ -538,7 +450,6 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 		}
 		if tc := agent.ParseToolCall(lastContent); tc != nil {
 			m.pruneTrailingToolCallMessage()
-			m.updateChatView()
 			m.convMgr.Save()
 			if m.shouldSkipDuplicateToolCall(tc) {
 				return m, m.skipDuplicateToolCall(tc)
@@ -546,8 +457,12 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 			return m, m.startToolExecution(tc)
 		}
 
-		m.updateChatView()
 		m.convMgr.Save()
+
+		var cmds []tea.Cmd
+		if trimmed := strings.TrimSpace(lastContent); trimmed != "" {
+			cmds = append(cmds, tea.Println(renderAssistantMessage(trimmed, m.width)))
+		}
 
 		// 如果没有工具调用，尝试自动提取文件内容
 		if m.shouldAutoExtractSingleFile() {
@@ -558,145 +473,37 @@ func (m *Model) handleStreamMsg(msg streamMsg) (tea.Model, tea.Cmd) {
 					m.noteTouchedFile(filePath)
 					current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已自动保存到文件: %s", filePath))
 				}
-				m.forceScrollBottom = true
-				m.updateChatView()
 				m.convMgr.Save()
 			}
 		}
 
 		if cmd := m.maybeContinueEngineeringToolFlow(lastContent); cmd != nil {
-			return m, cmd
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 		}
 
 		if cmd := m.maybeRunForcedPostProcess(); cmd != nil {
-			return m, cmd
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 		}
 
 		_ = completeTaskSpecHandoffIfNeeded(m.runtimePromptProfile, m.turnTouchedFiles, m.turnExecutedCommands, lastContent)
 
-		return m, nil
+		return m, tea.Batch(cmds...)
 	}
 
+	m.streamBuf.WriteString(msg.content)
+	m.tokenCount++
 	if len(current.Messages) > 0 {
 		last := &current.Messages[len(current.Messages)-1]
-		last.Content += msg.content
+		last.Content = m.streamBuf.String()
 		current.UpdatedAt = last.CreatedAt
 	}
-	m.updateChatView()
 	return m, m.waitForStream()
 }
 
 func (m *Model) View() string {
-	if m.width == 0 || m.height == 0 {
-		return "初始化中..."
-	}
-
-	if m.showSplash {
-		return m.renderSplash()
-	}
-
-	chat := m.renderChat()
-	input := m.renderInput()
-	status := m.renderStatusBar()
-	help := m.renderHelpBar()
-
-	parts := []string{chat}
-	if m.commandHintVisible {
-		parts = append(parts, m.renderCommandHint())
-	}
-	parts = append(parts, input, status, help)
-
-	return lipgloss.JoinVertical(lipgloss.Top, parts...)
-}
-
-func (m *Model) resize() {
-	const (
-		statusH        = 1
-		helpH          = 1
-		inputBorderTop = 1
-		inputPaddingV  = 1
-		inputPaddingH  = 2
-		chatPaddingV   = 1
-		chatPaddingH   = 2
-		textareaLines  = 1
-	)
-
-	inputH := inputBorderTop + inputPaddingV*2 + textareaLines
-
-	// 命令提示面板占用的高度
-	hintH := 0
-	if m.commandHintVisible {
-		hintH = m.commandHintHeight()
-	}
-
-	chatContentH := m.height - inputH - hintH - statusH - helpH - chatPaddingV*2
-	if chatContentH < 5 {
-		chatContentH = 5
-	}
-
-	chatContentW := m.width - chatPaddingH*2
-	if chatContentW < 20 {
-		chatContentW = 20
-	}
-
-	m.viewport.Width = chatContentW
-	m.viewport.Height = chatContentH
-
-	inputContentW := m.width - inputPaddingH*2
-	if inputContentW < 20 {
-		inputContentW = 20
-	}
-
-	m.textarea.SetWidth(inputContentW)
-	m.textarea.SetHeight(textareaLines)
-
-	m.updateChatView()
-}
-
-func (m *Model) inputAreaHeight() int {
-	const (
-		inputBorderTop = 1
-		inputPaddingV  = 1
-		textareaLines  = 1
-	)
-	return inputBorderTop + inputPaddingV*2 + textareaLines
-}
-
-func (m *Model) hintAreaHeight() int {
-	if m.commandHintVisible {
-		return m.commandHintHeight()
-	}
-	return 0
-}
-
-func (m *Model) chatAreaHeight() int {
-	const (
-		statusH = 1
-		helpH   = 1
-	)
-	chatH := m.height - m.inputAreaHeight() - m.hintAreaHeight() - statusH - helpH
-	if chatH < 1 {
-		return 1
-	}
-	return chatH
-}
-
-func (m *Model) isChatAreaY(y int) bool {
-	return y >= 0 && y < m.chatAreaHeight()
-}
-
-func (m *Model) isInputZoneY(y int) bool {
-	start := m.chatAreaHeight()
-	end := start + m.hintAreaHeight() + m.inputAreaHeight()
-	return y >= start && y < end
-}
-
-func (m *Model) toggleFocus() {
-	if m.focus == focusInput {
-		m.setFocusChat()
-	} else {
-		m.setFocusInput()
-	}
+	return m.renderInline()
 }
 
 func (m *Model) sendMessage() tea.Cmd {
@@ -725,6 +532,7 @@ func (m *Model) sendMessage() tea.Cmd {
 	// 发送新消息前，清理之前的系统消息（命令输出等），保持界面整洁
 	m.clearSystemMessages()
 	current.AddMessage(conversation.RoleUser, content)
+	userLine := renderUserMessage(content)
 
 	if shouldUseEngineeringPlanning(m.runtimePromptProfile, content) && !isExecutionApproval(content) {
 		if _, err := ensureTaskSpec(content, m.runtimePromptProfile); err != nil {
@@ -735,13 +543,10 @@ func (m *Model) sendMessage() tea.Cmd {
 		m.textarea.SetValue("")
 		m.isStreaming = false
 		m.err = nil
-		m.dotsAnim = 0
 		m.inputHistoryIdx = len(m.inputHistory)
 		m.inputHistoryTemp = ""
-		m.forceScrollBottom = true
-		m.updateChatView()
 		m.convMgr.Save()
-		return nil
+		return tea.Println(userLine)
 	}
 
 	if awaitingApproval && isExecutionApproval(content) {
@@ -752,15 +557,15 @@ func (m *Model) sendMessage() tea.Cmd {
 	m.textarea.SetValue("")
 	m.isStreaming = true
 	m.err = nil
-	m.dotsAnim = 0
 	m.inputHistoryIdx = len(m.inputHistory)
 	m.inputHistoryTemp = ""
-	m.forceScrollBottom = true
-	m.updateChatView()
 
 	if tc := buildPreflightToolCall(content); tc != nil {
 		current.UpdateLastMessage(tcToTag(tc))
-		return m.startToolExecution(tc)
+		return tea.Sequence(
+			tea.Println(userLine),
+			tea.Batch(m.startToolExecution(tc), tickCmd()),
+		)
 	}
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
@@ -768,7 +573,12 @@ func (m *Model) sendMessage() tea.Cmd {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
-	return tea.Batch(m.waitForStream(), tickCmd())
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
+
+	return tea.Sequence(tea.Println(userLine), tea.Batch(m.waitForStream(), tickCmd()))
 }
 
 func buildPreflightToolCall(content string) *agent.ToolCall {
@@ -819,10 +629,151 @@ func tcToTag(tc *agent.ToolCall) string {
 	return ""
 }
 
+// parseToolCallTag decodes an assistant message that stores a preflight tool call
+// as `<toolname>arg</toolname>`. Returns ok=false for anything else.
+func parseToolCallTag(content string) (name string, arg string, ok bool) {
+	content = strings.TrimSpace(content)
+	if len(content) < 3 || content[0] != '<' {
+		return "", "", false
+	}
+	end := strings.IndexByte(content, '>')
+	if end < 2 {
+		return "", "", false
+	}
+	tag := content[1:end]
+	// Reject non-tag chars
+	for _, r := range tag {
+		if r == '/' || r == ' ' || r == '<' || r == '>' {
+			return "", "", false
+		}
+	}
+	closeTag := "</" + tag + ">"
+	if !strings.HasSuffix(content, closeTag) {
+		return "", "", false
+	}
+	return tag, content[end+1 : len(content)-len(closeTag)], true
+}
+
+// replaySessionHistoryCmds returns tea.Println commands that reprint the last
+// `limit` visible messages of sess into scrollback. System messages and hidden
+// tool-result messages are skipped. Prepends a "(省略 N 条更早的消息)" line
+// when older messages are truncated.
+func (m *Model) replaySessionHistoryCmds(sess *conversation.Conversation, limit int) []tea.Cmd {
+	if sess == nil || len(sess.Messages) == 0 {
+		return nil
+	}
+	kept := make([]conversation.Message, 0, len(sess.Messages))
+	for i, msg := range sess.Messages {
+		if msg.Role == conversation.RoleSystem {
+			continue
+		}
+		if msg.Role == conversation.RoleUser && shouldHideToolResultInContext(sess.Messages, i) {
+			continue
+		}
+		if strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	omitted := 0
+	if limit > 0 && len(kept) > limit {
+		omitted = len(kept) - limit
+		kept = kept[len(kept)-limit:]
+	}
+	var cmds []tea.Cmd
+	if omitted > 0 {
+		cmds = append(cmds, tea.Println(SystemMessageStyle.Render(
+			fmt.Sprintf("(省略 %d 条更早的消息)", omitted))))
+	}
+	for _, msg := range kept {
+		line := m.renderHistoryMessage(msg)
+		if line == "" {
+			continue
+		}
+		cmds = append(cmds, tea.Println(line))
+	}
+	return cmds
+}
+
+func (m *Model) renderHistoryMessage(msg conversation.Message) string {
+	switch msg.Role {
+	case conversation.RoleUser:
+		if strings.HasPrefix(msg.Content, "<|tool_result|>") {
+			return ""
+		}
+		return renderUserMessage(msg.Content)
+	case conversation.RoleAssistant:
+		if name, arg, ok := parseToolCallTag(msg.Content); ok {
+			return renderHistoryToolCall(name, arg)
+		}
+		return renderAssistantMessage(msg.Content, m.width)
+	}
+	return ""
+}
+
+func renderHistoryToolCall(name, arg string) string {
+	argStr := arg
+	if argStr != "" {
+		argStr = fmt.Sprintf("%q", arg)
+	}
+	return fmt.Sprintf("%s %s(%s)  %s",
+		MarkerToolStart(),
+		name,
+		argStr,
+		CommandHintDescStyle.Render("(历史)"),
+	)
+}
+
+// previewFileContent returns the first `maxLines` lines (or `maxBytes` bytes,
+// whichever comes first) of content. truncated is true when content was cut.
+// totalLines is the total line count of the original content.
+func previewFileContent(content string, maxLines, maxBytes int) (preview string, truncated bool, totalLines int) {
+	if content == "" {
+		return "", false, 0
+	}
+	totalLines = strings.Count(content, "\n")
+	if !strings.HasSuffix(content, "\n") {
+		totalLines++
+	}
+	lines := strings.SplitAfter(content, "\n")
+	var b strings.Builder
+	for i, line := range lines {
+		if i >= maxLines {
+			truncated = true
+			break
+		}
+		if b.Len()+len(line) > maxBytes && b.Len() > 0 {
+			truncated = true
+			break
+		}
+		b.WriteString(line)
+	}
+	preview = strings.TrimRight(b.String(), "\n")
+	return preview, truncated, totalLines
+}
+
+func previewLineCount(preview string) int {
+	if preview == "" {
+		return 0
+	}
+	return strings.Count(preview, "\n") + 1
+}
+
 func canonicalizePreflightQuery(content string, match tools.MatchResult) string {
 	if match.Domain == "weather" {
 		location := strings.TrimSpace(match.Location)
 		timeOfDay := strings.TrimSpace(match.TimeOfDay)
+		if location != "" {
+			// 优先保留相对日期这个用户原话里的强信号（"明天/后天/今天"），比 N 天更贴意图
+			for _, day := range []string{"大后天", "后天", "明天", "今天"} {
+				if strings.Contains(content, day) {
+					return fmt.Sprintf("%s %s 天气预报", location, day)
+				}
+			}
+		}
 		if location != "" && match.ForecastDays > 1 {
 			return fmt.Sprintf("%s %d天 天气预报", location, match.ForecastDays)
 		}
@@ -906,6 +857,18 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		return nil
 	}
 
+	var cmds []tea.Cmd
+	emit := func(s string) {
+		cmds = append(cmds, tea.Println(s))
+	}
+
+	// Always clear the input textarea at the end of a command
+	defer func() {
+		m.textarea.SetValue("")
+		m.commandHintVisible = false
+		m.commandHintIndex = 0
+	}()
+
 	current := m.convMgr.GetCurrent()
 
 	switch parts[0] {
@@ -937,81 +900,65 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
   /write -a log.txt 追加内容 - 追加到文件
   /ls                    - 列出当前目录
   /ls src/               - 列出 src 目录`
-		current.AddMessage(conversation.RoleSystem, helpText)
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(helpText)
 
 	case "/clear":
 		current.Messages = nil
 		m.err = nil
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(MarkerAssistant() + " 已清空当前会话")
 
 	case "/new":
 		m.convMgr.NewConversation()
 		m.convMgr.Save()
-		m.forceScrollBottom = true
-		m.updateChatView()
+		emit(MarkerAssistant() + " 已新建会话")
 
 	case "/save":
 		if err := m.convMgr.Save(); err != nil {
 			m.err = err
+			emit(MarkerToolFail() + " 保存失败: " + err.Error())
 		} else {
-			current.AddMessage(conversation.RoleSystem, "✓ 对话已保存")
+			emit(MarkerToolOK() + " 对话已保存")
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/sessions":
-		convs := m.convMgr.List()
-		if len(convs) == 0 {
-			current.AddMessage(conversation.RoleSystem, "暂无会话")
-		} else {
-			var sb strings.Builder
-			curID := m.convMgr.GetCurrent().ID
-			sb.WriteString(fmt.Sprintf("会话列表 (共 %d 个):\n", len(convs)))
-			for i, c := range convs {
-				marker := "  "
-				if c.ID == curID {
-					marker = "▶ "
-				}
-				sb.WriteString(fmt.Sprintf("%s[%d] %s (%d 条消息) %s\n",
-					marker, i+1, c.Title, len(c.Messages),
-					c.UpdatedAt.Format("2006-01-02 15:04")))
-			}
-			sb.WriteString("\n输入 /open <序号> 进入指定会话")
-			current.AddMessage(conversation.RoleSystem, sb.String())
+		items := make([]pickerItem, 0)
+		curID := ""
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			curID = cur.ID
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
+		for _, c := range m.convMgr.List() {
+			items = append(items, pickerItemFromConversation(c, c.ID == curID))
+		}
+		m.picker = newSessionPicker(items)
+		m.pickerActive = true
 
 	case "/open":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /open <序号>\n输入 /sessions 查看会话列表")
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /open <序号>（输入 /sessions 查看会话列表）")
 			break
 		}
 		idx, err := strconv.Atoi(parts[1])
 		if err != nil || idx < 1 {
-			current.AddMessage(conversation.RoleSystem, "序号必须是正整数")
-			m.updateChatView()
+			emit(MarkerToolFail() + " 序号必须是正整数")
 			break
 		}
 		convs := m.convMgr.List()
 		if idx > len(convs) {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("序号超出范围，共 %d 个会话", len(convs)))
-			m.updateChatView()
+			emit(MarkerToolFail() + fmt.Sprintf(" 序号超出范围，共 %d 个会话", len(convs)))
 			break
 		}
-		m.convMgr.SetCurrent(convs[idx-1].ID)
-		m.forceScrollBottom = true
-		m.updateChatView()
+		target := convs[idx-1]
+		m.convMgr.SetCurrent(target.ID)
+		emit(MarkerAssistant() + fmt.Sprintf(" → 已切换到 %q", target.Title))
+		if cur := m.convMgr.GetCurrent(); cur != nil {
+			for _, c := range m.replaySessionHistoryCmds(cur, sessionHistoryReplayLimit) {
+				cmds = append(cmds, c)
+			}
+		}
 
 	case "/rename":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /rename <新名称>\n示例: /rename Python 脚本开发")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /rename <新名称>（示例: /rename Python 脚本开发）")
 			break
 		}
 		newTitle := strings.Join(parts[1:], " ")
@@ -1020,60 +967,56 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		current.Title = newTitle
 		current.UpdatedAt = time.Now()
 		if err := m.convMgr.Save(); err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 重命名失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 重命名失败: %v", err))
 		} else {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✓ 会话已重命名: %q → %q", oldTitle, newTitle))
+			emit(MarkerAssistant() + fmt.Sprintf(" 会话已重命名: %q → %q", oldTitle, newTitle))
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/read":
 		if len(parts) < 2 {
-			current.AddMessage(conversation.RoleSystem, "用法: /read <文件路径>\n示例: /read main.go")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /read <文件路径>（示例: /read main.go）")
 			break
 		}
 		path := strings.Join(parts[1:], " ")
 		fc, err := tools.ReadFile(path)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 读取失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 读取失败: %v", err))
 		} else {
 			current.AddMessage(conversation.RoleUser, fmt.Sprintf("请分析这个文件的内容:\n\n%s", tools.FormatFileContent(fc)))
+			preview, truncated, totalLines := previewFileContent(fc.Content, 60, 6000)
+			emit(fmt.Sprintf("%s %s (%d 行)", MarkerAssistant(), path, totalLines))
+			emit(preview)
+			if truncated {
+				emit(SystemMessageStyle.Render(
+					fmt.Sprintf("(仅显示前 %d 行预览，完整内容已加入下一轮上下文)", previewLineCount(preview))))
+			}
+			emit(MarkerToolOK() + " 已读取 " + path + "（内容已加入下一轮上下文）")
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/write":
 		if len(parts) < 3 {
-			current.AddMessage(conversation.RoleSystem, "用法: /write <文件路径> <内容>\n示例: /write hello.txt Hello World\n使用 -a 参数追加: /write -a log.txt 新内容")
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + " 用法: /write <文件路径> <内容>（示例: /write hello.txt Hello World；使用 -a 追加）")
 			break
 		}
 		args := strings.Join(parts[1:], " ")
 		path, content, appendMode, err := tools.ParseWriteArgs(args)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 参数错误: %v", err))
-			m.forceScrollBottom = true
-			m.updateChatView()
+			emit(MarkerToolFail() + fmt.Sprintf(" 参数错误: %v", err))
 			break
 		}
 		if err := tools.WriteFile(path, content+"\n", appendMode); err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 写入失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 写入失败: %v", err))
 		} else {
 			if appendMode {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已追加到 %s", path))
+				emit(MarkerToolOK() + fmt.Sprintf(" 已追加到 %s", path))
 			} else {
-				current.AddMessage(conversation.RoleSystem, fmt.Sprintf("✅ 已写入 %s", path))
+				emit(MarkerToolOK() + fmt.Sprintf(" 已写入 %s", path))
 			}
 			// 读取刚写入的文件，方便继续编辑
 			if fc, readErr := tools.ReadFile(path); readErr == nil {
 				current.AddMessage(conversation.RoleUser, fmt.Sprintf("文件内容已更新，继续编辑:\n\n%s", tools.FormatFileContent(fc)))
 			}
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/ls":
 		path := "."
@@ -1082,35 +1025,34 @@ func (m *Model) handleCommand(cmd string) tea.Cmd {
 		}
 		files, err := tools.ListDir(path)
 		if err != nil {
-			current.AddMessage(conversation.RoleSystem, fmt.Sprintf("❌ 读取目录失败: %v", err))
+			emit(MarkerToolFail() + fmt.Sprintf(" 读取目录失败: %v", err))
 		} else {
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("📂 目录: %s\n", path))
+			sb.WriteString(MarkerAssistant() + fmt.Sprintf(" 目录: %s\n", path))
 			for _, f := range files {
 				sb.WriteString("  " + f + "\n")
 			}
 			if len(files) == 0 {
 				sb.WriteString("  (空目录)\n")
 			}
-			current.AddMessage(conversation.RoleSystem, sb.String())
+			emit(strings.TrimRight(sb.String(), "\n"))
 		}
-		m.forceScrollBottom = true
-		m.updateChatView()
 
 	case "/quit":
 		m.convMgr.Save()
 		return tea.Quit
 
 	default:
-		current.AddMessage(conversation.RoleSystem, fmt.Sprintf("未知命令: %s\n输入 /help 查看可用命令", parts[0]))
-		m.updateChatView()
+		emit(MarkerToolFail() + fmt.Sprintf(" 未知命令: %s（输入 /help 查看可用命令）", parts[0]))
 	}
 
-	m.textarea.SetValue("")
-	m.commandHintVisible = false
-	m.commandHintIndex = 0
-	m.resize()
-	return nil
+	if len(cmds) == 0 {
+		return nil
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return tea.Sequence(cmds...)
 }
 
 func (m *Model) waitForStream() tea.Cmd {
@@ -1134,6 +1076,11 @@ func (m *Model) stopStreaming() {
 		m.streamCancel()
 	}
 	m.isStreaming = false
+	m.isThinking = false
+	m.streamBuf.Reset()
+	m.tokenCount = 0
+	m.activeToolCall = nil
+	m.isToolRunning = false
 }
 
 func (m *Model) buildMessages() []*schema.Message {
@@ -1210,226 +1157,6 @@ func (m *Model) selectRuntimePrompt(content string) {
 	m.runtimePromptSummary = loadRuntimePrompt(profile)
 }
 
-func (m *Model) updateChatView() {
-	current := m.convMgr.GetCurrent()
-	var messages []string
-
-	if len(current.Messages) == 0 {
-		bannerText := renderBanner(m.viewport.Width)
-		messages = append(messages, bannerText)
-		messages = append(messages, "")
-
-		welcome := WelcomeStyle.Render("  欢迎使用 FreeX Claw 终端 AI 助手")
-		messages = append(messages, welcome)
-		messages = append(messages, "")
-
-		tips := []string{
-			"  💡 快捷操作:",
-			"     Enter       发送消息",
-			"     Ctrl+J      换行",
-			"     Esc         切换焦点（输入框 ↔ 聊天区）",
-			"     j/k         聊天区上下滚动",
-			"     Ctrl+u/d    聊天区上下翻页",
-			"     g/G         聊天区跳到顶部/底部",
-			"     /help       显示帮助",
-			"     Ctrl+C      退出或停止生成",
-			"",
-			"  🚀 在下方输入消息，开始你的 AI 之旅！",
-		}
-		for _, tip := range tips {
-			messages = append(messages, PlaceholderStyle.Render(tip))
-		}
-		messages = append(messages, "")
-	}
-
-	for i, msg := range current.Messages {
-		content := current.Messages[i].Content
-
-		if msg.Role == conversation.RoleSystem {
-			messages = append(messages, SystemMessageStyle.Render(content))
-			messages = append(messages, "")
-			continue
-		}
-
-		// 工具结果消息（来自用户角色的 tool_result），美化显示
-		if msg.Role == conversation.RoleUser && strings.HasPrefix(content, "<|tool_result|>") && strings.HasSuffix(content, "</|tool_result|>") {
-			if shouldHideToolResultInContext(current.Messages, i) {
-				continue
-			}
-			resultContent := strings.TrimPrefix(content, "<|tool_result|>")
-			resultContent = strings.TrimSuffix(resultContent, "</|tool_result|>")
-			resultContent = strings.TrimSpace(resultContent)
-			display := "🔧 工具执行结果\n" + resultContent
-			messages = append(messages, ToolResultStyle.Render(display))
-			messages = append(messages, "")
-			continue
-		}
-
-		// AI 消息中包含工具调用标记，美化显示
-		if msg.Role == conversation.RoleAssistant && (strings.Contains(content, "<write_file>") || strings.Contains(content, "<read_file>") || strings.Contains(content, "<list_dir>") || strings.Contains(content, "<append_file>") || strings.Contains(content, "<web_search>") || strings.Contains(content, "<run_command>")) {
-			tc := agent.ParseToolCall(content)
-			if tc != nil {
-				// 显示思考过程（工具调用之前的文本）和工具调用
-				display := fmt.Sprintf("🔧 正在调用工具: %s", tc.Name)
-				if tc.Name == "write_file" || tc.Name == "append_file" {
-					if path, ok := tc.Arguments["path"].(string); ok {
-						display += fmt.Sprintf(" → %s", path)
-					}
-				} else if tc.Name == "read_file" || tc.Name == "list_dir" {
-					if path, ok := tc.Arguments["path"].(string); ok {
-						display += fmt.Sprintf(" → %s", path)
-					}
-				} else if tc.Name == "run_command" {
-					if command, ok := tc.Arguments["command"].(string); ok {
-						display += fmt.Sprintf(" → %s", command)
-					}
-				}
-				messages = append(messages, AIPrefixStyle.Render("● ")+MessageContentStyle.Render(display))
-				messages = append(messages, "")
-				continue
-			}
-		}
-
-		var prefix string
-		var prefixStyle lipgloss.Style
-
-		switch msg.Role {
-		case conversation.RoleUser:
-			prefix = "┃ "
-			prefixStyle = UserPrefixStyle
-		case conversation.RoleAssistant:
-			prefix = "● "
-			prefixStyle = AIPrefixStyle
-		}
-
-		if msg.Role == conversation.RoleAssistant && m.isStreaming && content == "" {
-			dots := ""
-			switch m.dotsAnim % 4 {
-			case 0:
-				dots = "   "
-			case 1:
-				dots = ".  "
-			case 2:
-				dots = ".. "
-			case 3:
-				dots = "..."
-			}
-			thinking := ThinkingStyle.Render("● thinking" + dots)
-			messages = append(messages, thinking)
-			messages = append(messages, "")
-			continue
-		}
-
-		var rendered string
-		isLastAssistant := msg.Role == conversation.RoleAssistant && i == len(current.Messages)-1
-		isStreamingThisMsg := m.isStreaming && isLastAssistant
-		if msg.Role == conversation.RoleAssistant && content != "" && !isStreamingThisMsg {
-			rendered = renderMarkdown(content, m.viewport.Width)
-		} else {
-			rendered = MessageContentStyle.Render(content)
-		}
-
-		lines := strings.SplitN(rendered, "\n", 2)
-		if len(lines) > 0 {
-			lines[0] = prefixStyle.Render(prefix) + lines[0]
-		}
-		messages = append(messages, strings.Join(lines, "\n"))
-		messages = append(messages, "")
-	}
-
-	if m.isToolRunning {
-		toolLine := "● 工具执行中"
-		if strings.TrimSpace(m.toolStatusText) != "" {
-			toolLine = "● " + m.toolStatusText
-		}
-		messages = append(messages, ThinkingStyle.Render(toolLine))
-		messages = append(messages, "")
-	}
-
-	fullContent := lipgloss.JoinVertical(lipgloss.Left, messages...)
-
-	// SetContent 之前记录用户是否在底部（内容变化后 AtBottom 会不准）
-	wasAtBottom := m.viewport.AtBottom()
-
-	m.viewport.SetContent(fullContent)
-
-	// 强制滚动 或 用户之前在底部 或 视口还没初始化（0高度），都滚到底部
-	if m.forceScrollBottom || wasAtBottom || m.viewport.Height == 0 {
-		m.viewport.GotoBottom()
-		m.forceScrollBottom = false
-	}
-}
-
-func (m *Model) renderChat() string {
-	return ChatViewStyle.Width(m.width).Render(m.viewport.View())
-}
-
-func (m *Model) renderInput() string {
-	var inputView string
-	if m.isStreaming {
-		inputView = PlaceholderStyle.Render("⏳ 正在生成回复... 按 Ctrl+C 停止")
-	} else if m.isToolRunning {
-		inputView = PlaceholderStyle.Render("⏳ 正在处理... 详见上方进度")
-	} else {
-		inputView = m.textarea.View()
-	}
-	return InputAreaStyle.Width(m.width).Render(inputView)
-}
-
-func (m *Model) renderStatusBar() string {
-	var parts []string
-
-	brand := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#A78BFA")).
-		Bold(true).
-		Render("FreeX Claw")
-
-	modelInfo := m.cfg.Model
-
-	current := m.convMgr.GetCurrent()
-	convInfo := current.Title
-
-	parts = append(parts, brand, modelInfo, convInfo)
-
-	cwd := tools.GetWorkDir()
-	cwdStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#86EFAC")).
-		Render(cwd)
-	parts = append(parts, cwdStyle)
-
-	if m.isStreaming {
-		status := lipgloss.NewStyle().Foreground(lipgloss.Color("#22D3EE")).Render("● streaming")
-		parts = append(parts, status)
-	}
-
-	if m.err != nil {
-		errInfo := lipgloss.NewStyle().Foreground(ErrorColor).Render(fmt.Sprintf("错误: %v", m.err))
-		parts = append(parts, errInfo)
-	}
-
-	if m.flashMessage != "" {
-		flash := lipgloss.NewStyle().Foreground(lipgloss.Color("#86EFAC")).Render(m.flashMessage)
-		parts = append(parts, flash)
-	}
-
-	status := strings.Join(parts, " │ ")
-	return StatusBarStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(status)
-}
-
-func (m *Model) renderHelpBar() string {
-	var help string
-	if m.focus == focusInput {
-		if m.shouldQuitOnCtrlC() {
-			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | shift+拖拽 复制 | ctrl+c 再按退出"
-		} else {
-			help = "enter 发送 | shift+enter 换行 | ↑↓/滚轮 历史 | esc 聊天区 | shift+拖拽 复制 | ctrl+c 清空/退出"
-		}
-	} else {
-		help = "j/k/滚轮 滚动 | ctrl+u/d 翻页 | g/G 顶/底 | y 复制最后回复 | shift+拖拽 复制 | 点击/esc 返回输入"
-	}
-	return HelpStyle.Width(m.width).MaxWidth(m.width).MaxHeight(1).Render(help)
-}
-
 // updateCommandHint 根据输入框当前值更新命令提示面板状态，返回可见性是否有变化
 func (m *Model) updateCommandHint() bool {
 	oldVisible := m.commandHintVisible
@@ -1466,38 +1193,6 @@ func (m *Model) matchedCommands() []commandItem {
 		}
 	}
 	return matched
-}
-
-// commandHintHeight 返回命令提示面板占用的行数（含边框）
-func (m *Model) commandHintHeight() int {
-	matched := m.matchedCommands()
-	if len(matched) == 0 {
-		return 0
-	}
-	// 命令行数 + 上下边框(2)
-	return len(matched) + 2
-}
-
-// renderCommandHint 渲染命令提示面板
-func (m *Model) renderCommandHint() string {
-	matched := m.matchedCommands()
-	if len(matched) == 0 {
-		return ""
-	}
-	var lines []string
-	for i, cmd := range matched {
-		marker := "  "
-		nameStyle := CommandHintItemStyle
-		if i == m.commandHintIndex {
-			marker = "▶ "
-			nameStyle = CommandHintSelectedItemStyle
-		}
-		line := marker + nameStyle.Render(cmd.Name) + "  " + CommandHintDescStyle.Render(cmd.Desc)
-		lines = append(lines, line)
-	}
-	content := strings.Join(lines, "\n")
-	// border 2 + padding 2 = 4，使总宽度 = m.width
-	return CommandHintStyle.Width(m.width - 4).Render(content)
 }
 
 // clearSystemMessages 清除对话中所有的系统消息（命令输出、提示信息等）
@@ -1559,8 +1254,11 @@ func (m *Model) navigateHistory(direction int) {
 func (m *Model) startToolExecution(tc *agent.ToolCall) tea.Cmd {
 	m.isToolRunning = true
 	m.toolStatusText = describeToolExecution(tc)
-	m.forceScrollBottom = true
-	m.updateChatView()
+	m.activeToolCall = &pendingTool{
+		Name:      tc.Name,
+		Arguments: tc.Arguments,
+		StartedAt: time.Now(),
+	}
 	m.convMgr.Save()
 	m.toolCh = runToolAsync(tc)
 	return m.waitForToolEvent()
@@ -1572,6 +1270,21 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	result := msg.result
 	m.isToolRunning = false
 	m.toolStatusText = ""
+
+	// Capture display info from activeToolCall BEFORE clearing
+	var toolLine string
+	if m.activeToolCall != nil {
+		durationMS := int(time.Since(m.activeToolCall.StartedAt) / time.Millisecond)
+		summary := result.Output
+		if !result.Success && result.Error != "" {
+			summary = result.Error
+		}
+		if len(summary) > 200 {
+			summary = summary[:200] + "..."
+		}
+		toolLine = renderToolCall(m.activeToolCall.Name, m.activeToolCall.Arguments, summary, result.Success, durationMS)
+	}
+	m.activeToolCall = nil
 
 	if tc.Name == "run_command" {
 		m.turnSawRunCommand = true
@@ -1604,10 +1317,11 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	current.AddMessage(conversation.RoleAssistant, "")
 
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
-	m.dotsAnim = 0
-	m.forceScrollBottom = true
-	m.updateChatView()
 	m.convMgr.Save()
 
 	// 启动下一轮流式
@@ -1615,7 +1329,11 @@ func (m *Model) handleToolExecuted(msg toolExecutedMsg) (tea.Model, tea.Cmd) {
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
 
-	return m, tea.Batch(m.waitForStream(), tickCmd())
+	continueCmd := m.waitForStream()
+	if toolLine == "" {
+		return m, continueCmd
+	}
+	return m, tea.Sequence(tea.Println(toolLine), continueCmd)
 }
 
 func (m *Model) pruneTrailingToolCallMessage() {
@@ -1689,16 +1407,17 @@ func (m *Model) maybeContinueEngineeringToolFlow(lastContent string) tea.Cmd {
 	current.AddMessage(conversation.RoleAssistant, "")
 	m.turnEngineeringNudged = true
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
-	m.dotsAnim = 0
-	m.forceScrollBottom = true
-	m.updateChatView()
 	m.convMgr.Save()
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
-	return tea.Batch(m.waitForStream(), tickCmd())
+	return m.waitForStream()
 }
 
 func (m *Model) noteTouchedFile(path string) {
@@ -1742,8 +1461,6 @@ func (m *Model) maybeRunForcedPostProcess() tea.Cmd {
 		if len(m.turnAutoToolQueue) > 0 {
 			current := m.convMgr.GetCurrent()
 			current.AddMessage(conversation.RoleSystem, "🛠️ 检测到项目生成任务，开始自动执行初始化与基础校验...")
-			m.forceScrollBottom = true
-			m.updateChatView()
 			m.convMgr.Save()
 		}
 	}
@@ -1792,16 +1509,17 @@ func (m *Model) skipDuplicateToolCall(tc *agent.ToolCall) tea.Cmd {
 	current.AddMessage(conversation.RoleUser, "<|tool_result|>\n已跳过重复的 web_search 调用，请直接基于已有查询结果继续回答，不要再次调用相同查询。\n</|tool_result|>")
 	current.AddMessage(conversation.RoleAssistant, "")
 	m.isStreaming = true
+	m.isThinking = true
+	m.thinkingLabel = "思考中"
+	m.tokenCount = 0
+	m.streamBuf.Reset()
 	m.err = nil
-	m.dotsAnim = 0
-	m.forceScrollBottom = true
-	m.updateChatView()
 	m.convMgr.Save()
 
 	m.streamCtx, m.streamCancel = context.WithCancel(context.Background())
 	messages := m.buildMessages()
 	m.chunkCh = m.llmClient.StreamChat(m.streamCtx, messages)
-	return tea.Batch(m.waitForStream(), tickCmd())
+	return m.waitForStream()
 }
 
 func runToolAsync(tc *agent.ToolCall) <-chan tea.Msg {
@@ -1837,4 +1555,179 @@ func describeToolExecution(tc *agent.ToolCall) string {
 		}
 	}
 	return "正在处理工具请求"
+}
+
+// renderInline is the new inline scrollback View renderer. It renders only the
+// currently-active UI (textarea, spinner, tool line, status bar). Historical
+// messages are pushed to scrollback via tea.Println by callers.
+// NOT YET WIRED to View(); Task 9 does the switch.
+func (m *Model) renderInline() string {
+	if m.pickerActive && m.picker != nil {
+		return m.picker.View() + "\n" + m.renderStatusBarInline()
+	}
+
+	var parts []string
+	parts = append(parts, m.renderInputDividerInline())
+	parts = append(parts, m.textarea.View())
+
+	if hint := m.renderCommandHintInline(); hint != "" {
+		parts = append(parts, hint)
+	}
+	if m.isThinking {
+		parts = append(parts, m.renderSpinnerLine())
+	}
+	if m.activeToolCall != nil {
+		parts = append(parts, m.renderToolCallLine())
+	}
+	parts = append(parts, m.renderStatusBarInline())
+	return strings.Join(parts, "\n")
+}
+
+// renderInputDividerInline draws a subtle labeled rule above the textarea so
+// the input zone is visually separated from the scrollback message area.
+// Format: `╭─ ✎ 输入 ──────────────────────────`
+func (m *Model) renderInputDividerInline() string {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	label := " ✎ 输入 "
+	prefix := "╭─"
+	ruleStyle := lipgloss.NewStyle().Foreground(MutedColor).Faint(true)
+	labelStyle := lipgloss.NewStyle().Foreground(UserColor).Bold(true)
+	labelW := runewidth.StringWidth(label)
+	prefixW := runewidth.StringWidth(prefix)
+	remain := w - prefixW - labelW
+	if remain < 0 {
+		// Terminal too narrow — fall back to a plain rule.
+		return ruleStyle.Render(strings.Repeat("─", w))
+	}
+	return ruleStyle.Render(prefix) + labelStyle.Render(label) + ruleStyle.Render(strings.Repeat("─", remain))
+}
+
+// renderCommandHintInline draws the slash-command completion dropdown just below
+// the textarea when the user is typing a "/" command. Returns "" when hidden.
+func (m *Model) renderCommandHintInline() string {
+	if !m.commandHintVisible {
+		return ""
+	}
+	matched := m.matchedCommands()
+	if len(matched) == 0 {
+		return ""
+	}
+	const maxRows = 8
+	sel := m.commandHintIndex
+	if sel < 0 {
+		sel = 0
+	}
+	if sel >= len(matched) {
+		sel = len(matched) - 1
+	}
+	if len(matched) > maxRows {
+		start := 0
+		if sel >= maxRows {
+			start = sel - maxRows + 1
+		}
+		matched = matched[start : start+maxRows]
+		sel -= start
+	}
+	maxName := 0
+	for _, c := range matched {
+		if n := len(c.Name); n > maxName {
+			maxName = n
+		}
+	}
+	var lines []string
+	for i, c := range matched {
+		nameCol := c.Name + strings.Repeat(" ", maxName-len(c.Name))
+		var line string
+		if i == sel {
+			line = CommandHintSelectedItemStyle.Render(nameCol) + "  " + CommandHintDescStyle.Render(c.Desc)
+		} else {
+			line = CommandHintItemStyle.Render(nameCol) + "  " + CommandHintDescStyle.Render(c.Desc)
+		}
+		lines = append(lines, line)
+	}
+	footer := CommandHintDescStyle.Render("↑↓ 选择 · Tab/Enter 补全 · Esc 取消")
+	body := strings.Join(lines, "\n") + "\n" + footer
+	return CommandHintStyle.Render(body)
+}
+
+func (m *Model) renderSpinnerLine() string {
+	frame := BrandSpinnerFrames[m.spinnerTickN%len(BrandSpinnerFrames)]
+	label := m.thinkingLabel
+	if label == "" {
+		label = "思考中"
+	}
+	return lipgloss.NewStyle().Foreground(AssistantColor).Bold(true).Render(frame) +
+		" " + label + "... " +
+		lipgloss.NewStyle().Foreground(MutedColor).Faint(true).
+			Render(fmt.Sprintf("(%d tokens)", m.tokenCount))
+}
+
+func (m *Model) renderToolCallLine() string {
+	if m.activeToolCall == nil {
+		return ""
+	}
+	frame := BrandSpinnerFrames[m.spinnerTickN%len(BrandSpinnerFrames)]
+	args := formatToolArgs(m.activeToolCall.Arguments)
+	head := fmt.Sprintf("%s %s(%s)", MarkerToolStart(), m.activeToolCall.Name, args)
+	sub := fmt.Sprintf("  %s 执行中...",
+		lipgloss.NewStyle().Foreground(AssistantColor).Render(frame))
+	return head + "\n" + sub
+}
+
+// renderStatusBarInline draws the branded two-line status bar:
+// a gradient rule on top and an icon-separated info line below.
+func (m *Model) renderStatusBarInline() string {
+	sep := " │ "
+	title := "会话1"
+	msgCount := 0
+	if m.convMgr != nil {
+		if sess := m.convMgr.GetCurrent(); sess != nil {
+			title = sess.Title
+			if title == "" {
+				title = "会话1"
+			}
+			msgCount = len(sess.Messages)
+		}
+	}
+	modelName := ""
+	if m.cfg != nil {
+		modelName = m.cfg.Model
+	}
+	parts := []string{
+		MarkerAssistant() + " FreeX Claw",
+		modelName,
+		fmt.Sprintf("📁 %s (%d条)", title, msgCount),
+		"/help",
+	}
+	info := StatusBarStyle.Render(strings.Join(parts, sep))
+
+	lineW := m.width
+	if lineW <= 0 {
+		lineW = 80
+	}
+	gradient := renderGradientLine(lineW)
+	return gradient + "\n" + info
+}
+
+// renderGradientLine draws a horizontal rule using a two-color simple gradient
+// (UserColor → AssistantColor) over the given width using the ▔ glyph.
+func renderGradientLine(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	mid := width / 2
+	userStyle := lipgloss.NewStyle().Foreground(UserColor)
+	assistStyle := lipgloss.NewStyle().Foreground(AssistantColor)
+	chars := make([]string, width)
+	for i := 0; i < width; i++ {
+		if i < mid {
+			chars[i] = userStyle.Render("▔")
+		} else {
+			chars[i] = assistStyle.Render("▔")
+		}
+	}
+	return strings.Join(chars, "")
 }

@@ -12,6 +12,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-runewidth v0.0.19
 	github.com/spf13/viper v1.21.0
+	golang.org/x/term v0.44.0
 	modernc.org/sqlite v1.53.0
 )
 

@@ -1,7 +1,5 @@
 # Live Query Router Phase 1 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** 为 FreeX Claw 增加第一阶段实时查询路由层，支持天气追问承接、7 天预报、新闻摘要、汇率和股价，并在失败时优雅回退到通用搜索。
 
 **Architecture:** 在 `internal/tools` 中增加“路由器 + 上下文 + provider”结构，保留现有 `web_search` 入口不变。天气、新闻、金融分别走专用 provider，最终统一转换成 `SearchResult` 风格文本输出，未命中或失败时再回退 Bing。
