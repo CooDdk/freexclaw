@@ -85,6 +85,32 @@ func TestSystemPrompt_MentionsEditFile(t *testing.T) {
 	}
 }
 
+func TestParseToolCall_Grep(t *testing.T) {
+	body := "<grep>func Hello\npath: internal\nglob: *.go\ncase: i\n</grep>"
+	tc := ParseToolCall(body)
+	if tc == nil || tc.Name != "grep" {
+		t.Fatalf("expected grep tool call, got %#v", tc)
+	}
+	if got := tc.Arguments["pattern"]; got != "func Hello" {
+		t.Fatalf("pattern: %#v", got)
+	}
+	if got := tc.Arguments["path"]; got != "internal" {
+		t.Fatalf("path: %#v", got)
+	}
+	if got := tc.Arguments["glob"]; got != "*.go" {
+		t.Fatalf("glob: %#v", got)
+	}
+	if got := tc.Arguments["ignore_case"]; got != true {
+		t.Fatalf("ignore_case: %#v", got)
+	}
+}
+
+func TestSystemPrompt_MentionsGrep(t *testing.T) {
+	if !strings.Contains(SystemPrompt(), "<grep>") {
+		t.Fatalf("system prompt should advertise <grep>")
+	}
+}
+
 func containsAll(s string, parts ...string) bool {
 	for _, part := range parts {
 		if !strings.Contains(s, part) {
