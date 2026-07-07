@@ -48,7 +48,7 @@ func TestRenderCommandConfirmPrompt_ShowsCwdAndCmd(t *testing.T) {
 	if !strings.Contains(out, "cmd: go test ./...") {
 		t.Fatalf("expected cmd line, got %q", out)
 	}
-	if !strings.Contains(out, "y=允许") {
+	if !strings.Contains(out, "按 y 允许") {
 		t.Fatalf("expected y/n hint, got %q", out)
 	}
 }

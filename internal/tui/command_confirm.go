@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/CooDdk/freexclaw/internal/agent"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // pendingCommandConfirm 保存一个等待用户 y/n 确认的 run_command 调用。
@@ -21,6 +22,17 @@ func needsCommandConfirm(tc *agent.ToolCall, yolo bool) bool {
 	return tc.Name == "run_command"
 }
 
+var (
+	confirmHeaderStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#F59E0B")).
+				Bold(true)
+	confirmBodyStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E5E7EB"))
+	confirmHintStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#9CA3AF")).
+				Italic(true)
+)
+
 // renderCommandConfirmPrompt 生成展示给用户的确认提示行。
 func renderCommandConfirmPrompt(tc *agent.ToolCall) string {
 	if tc == nil {
@@ -28,12 +40,17 @@ func renderCommandConfirmPrompt(tc *agent.ToolCall) string {
 	}
 	command, _ := tc.Arguments["command"].(string)
 	cwd, _ := tc.Arguments["cwd"].(string)
+
 	var sb strings.Builder
-	sb.WriteString("? 允许执行下面这条命令吗？(y=允许 / n=拒绝)\n")
+	sb.WriteString(confirmHeaderStyle.Render("⚠  需要授权：run_command"))
+	sb.WriteByte('\n')
 	if cwd != "" {
-		sb.WriteString(fmt.Sprintf("  cwd: %s\n", cwd))
+		sb.WriteString(confirmBodyStyle.Render(fmt.Sprintf("  cwd: %s", cwd)))
+		sb.WriteByte('\n')
 	}
-	sb.WriteString(fmt.Sprintf("  cmd: %s", command))
+	sb.WriteString(confirmBodyStyle.Render(fmt.Sprintf("  cmd: %s", command)))
+	sb.WriteByte('\n')
+	sb.WriteString(confirmHintStyle.Render("  按 y 允许 / n 拒绝 / Esc 取消"))
 	return sb.String()
 }
 
